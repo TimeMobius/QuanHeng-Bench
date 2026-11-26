@@ -1,0 +1,7 @@
+# Pin the toolchain so local builds, CI and release images agree.
+# (rusqlite's bundled SQLite and the MSRV of the dependency tree are validated
+#  against this version, same as the deployment image.)
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

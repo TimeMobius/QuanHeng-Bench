@@ -1,0 +1,16 @@
+# Build context hygiene: keep the image build small and reproducible.
+target/
+target-arm64/
+data/
+dist/
+.git/
+.omo/
+.codegraph/
+docs/
+*.tar
+*.tar.gz
+*.tar.zst
+cross-gcc-*.src.rpm
+*.db
+*.db-wal
+*.db-shm

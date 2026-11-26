@@ -1,0 +1,88 @@
+# .github/workflows/release.yml
+
+name: Create Release and Update README
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release:
+    # [skip ci] 防止版本提交触发自身的死循环
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from commit count
+        id: version
+        run: |
+          commit_count=$(git rev-list --count HEAD)
+          cargo_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "tag=b${commit_count}" >> $GITHUB_OUTPUT
+          echo "cargo_version=${cargo_version}" >> $GITHUB_OUTPUT
+
+      - name: Set owner to lowercase
+        run: echo "OWNER_LC=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      # 镜像 tag 跟随构建号，README 里的拉取命令保持最新
+      - name: Update README.md with new version
+        run: |
+          sed -i "s|\(ghcr.io/${{ env.OWNER_LC }}/quanheng-bench:\)[^ \`\"]*|\1${{ steps.version.outputs.tag }}|g" README.md
+
+      - name: Commit and push release metadata
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add README.md
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(release): update image tag to ${{ steps.version.outputs.tag }} [skip ci]"
+            git push
+          else
+            echo "No README changes to commit."
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.tag }}
+          body: |
+            ${{ github.event.head_commit.message }}
+
+            ---
+
+            **Container image** (multi-arch: linux/amd64 + linux/arm64)
+
+            ```bash
+            docker pull ghcr.io/${{ env.OWNER_LC }}/quanheng-bench:${{ steps.version.outputs.tag }}
+            ```
+
+            **Build from source**
+
+            ```bash
+            cargo build --release   # -> target/release/quanheng
+            ```
+          draft: false
+          prerelease: false
+
+      # 发布附件：双架构 tar 包 + SHA256（复用 build.sh，与本地构建一致）
+      - name: Build release tarballs
+        run: |
+          ./build.sh -v "${{ steps.version.outputs.tag }}" -o ./dist
+          cd dist && sha256sum quanheng-bench-*.tar.gz > SHA256SUMS
+
+      - name: Upload tarballs to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: |
+            dist/quanheng-bench-*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true

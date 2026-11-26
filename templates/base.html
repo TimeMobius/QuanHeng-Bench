@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="LLM API 性能测试监控：TTFT、TPS、成功率、跨日期趋势与多模型对比">
+  <title>{% block title %}LLM 性能监控{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="/icons/xiaoke.svg">
+  <script>
+    /* 唯一允许的内联脚本：首屏渲染前确定主题，避免深色模式白屏闪烁 */
+    (function () {
+      try {
+        var mode = window.localStorage.getItem('hc.theme');
+        if (mode !== 'light' && mode !== 'dark') { mode = 'auto'; }
+        var dark = mode === 'dark' || (mode === 'auto' && window.matchMedia
+          && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+        document.documentElement.setAttribute('data-theme-mode', mode);
+      } catch (err) {
+        document.documentElement.setAttribute('data-theme', 'light');
+        document.documentElement.setAttribute('data-theme-mode', 'auto');
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="/assets/css/app.css">
+</head>
+<body data-page="{% block page_kind %}dashboard{% endblock %}"
+      data-date="{% block page_date %}{% endblock %}"
+      data-today="{{ today|default('') }}"
+      data-base-url="{{ base_url|default('') }}">
+
+  <a class="skip-link" href="#view-root">跳到主要内容</a>
+
+  {% include "partials/header.html" %}
+
+  <main class="app-main" id="view-root" role="tabpanel" aria-labelledby="tab-overview" tabindex="-1">
+    <div class="boot-skeleton" data-boot-skeleton>
+      <div class="skeleton skeleton--title"></div>
+      <div class="kpi-grid">
+        <div class="skeleton skeleton--kpi"></div>
+        <div class="skeleton skeleton--kpi"></div>
+        <div class="skeleton skeleton--kpi"></div>
+        <div class="skeleton skeleton--kpi"></div>
+        <div class="skeleton skeleton--kpi"></div>
+        <div class="skeleton skeleton--kpi"></div>
+        <div class="skeleton skeleton--kpi"></div>
+      </div>
+      <div class="skeleton skeleton--chart"></div>
+      <div class="skeleton skeleton--table"></div>
+    </div>
+  </main>
+
+  {% include "partials/footer.html" %}
+
+  <div class="toast-stack" id="toast-stack" role="status" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="/assets/vendor/chart.js/chart.umd.min.js" defer></script>
+  <script type="module" src="/assets/js/main.js"></script>
+</body>
+</html>

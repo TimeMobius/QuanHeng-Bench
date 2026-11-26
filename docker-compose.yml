@@ -1,0 +1,43 @@
+services:
+  quanheng-bench:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - BASE_URL=${BASE_URL:-http://localhost:8000}
+      - HOST=0.0.0.0
+      - PORT=3000
+      - DB_PATH=/app/data/records.db
+      - CONCURRENCY_LEVELS=1,2,4,8,16,32,64
+      # Lower bound of requests per concurrency level (band formula still applies)
+      - REQUESTS_PER_LEVEL=10
+      # Models tested simultaneously; total fan-out = this x concurrency
+      - MAX_PARALLEL_MODELS=8
+      - MODELS_CACHE_SECS=60
+      # Protocol v2: auto-negotiate exact token usage (auto | true | false)
+      - STREAM_INCLUDE_USAGE=${STREAM_INCLUDE_USAGE:-auto}
+      # Protocol v2: defeat prefix KV caching (head nonce + per-level rotation)
+      - CACHE_BUST=${CACHE_BUST:-1}
+      # Discarded warm-up requests per (model, level); cache-bust only
+      - WARMUP_REQUESTS=${WARMUP_REQUESTS:-2}
+      # Target input length in tokens (0 = question bank as-is)
+      - INPUT_TOKENS=${INPUT_TOKENS:-0}
+      # Output token budget (0 = use MAX_TOKENS)
+      - OUTPUT_TOKENS=${OUTPUT_TOKENS:-0}
+      - TEST_RUNS=3
+      - QUESTIONS_PER_RUN=20
+      - MAX_TOKENS=512
+      - REQUEST_TIMEOUT_SECS=1800
+      - TZ_OFFSET_HOURS=8
+      - SCHEDULED_HOUR=3
+      - SCHEDULED_MINUTE=0
+      - TZ=Asia/Shanghai
+      # Optional: API key for Bearer auth
+      # - API_KEY=sk-your-key-here
+      # Optional: comma separated CORS origins (unset = same origin only)
+      # - CORS_ORIGINS=https://ops.example.com
+      # Optional: run a test on startup when today has no data (default true)
+      # - RUN_ON_START=true
+    restart: unless-stopped

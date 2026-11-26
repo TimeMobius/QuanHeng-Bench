@@ -1,0 +1,20 @@
+target/
+target-arm64/
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+# dist/ 里的镜像 tar 包不入库，但双架构使用手册要跟版本走
+dist/*
+!dist/使用手册.md
+*.tar
+*.tar.gz
+*.tar.zst
+
+# 本地工具/构建工作区
+.omo/
+.codegraph/
+
+# 交叉编译构建遗留
+cross-gcc-*.src.rpm

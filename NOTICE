@@ -1,0 +1,12 @@
+QuanHeng-Bench
+Copyright 2026 QuanHeng-Bench contributors
+
+This product includes software developed by the QuanHeng-Bench project.
+
+The files under icons/ contain logos and marks that are trademarks of their
+respective owners. They are included solely to identify the corresponding
+model vendors in the dashboard and do not imply endorsement.
+
+Bundled third-party assets:
+  - Chart.js 4.4.7 (assets/vendor/chart.js) — MIT License,
+    https://www.chartjs.org

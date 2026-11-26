@@ -1,0 +1,5 @@
+{% extends "base.html" %}
+
+{% block title %}历史 {{ date|default('') }} · LLM 性能监控{% endblock %}
+{% block page_kind %}history{% endblock %}
+{% block page_date %}{{ date|default('') }}{% endblock %}
