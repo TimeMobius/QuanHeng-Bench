@@ -6,6 +6,8 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  # 手动重跑（验证流水线改动、或在分支保护下补跑）
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
