@@ -134,16 +134,15 @@ jobs:
 
       - name: Set env vars
         run: |
-          echo "COUNT=$(git rev-list --count HEAD)" >> $GITHUB_ENV
           echo "OWNER_LC=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
           echo "VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')" >> $GITHUB_ENV
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
+          # 语义化 tag 跟随 Cargo.toml；latest 指向 main 头，便于尝鲜
           docker buildx imagetools create \
             -t ghcr.io/${{ env.OWNER_LC }}/quanheng-bench:v${{ env.VERSION }} \
-            -t ghcr.io/${{ env.OWNER_LC }}/quanheng-bench:b${{ env.COUNT }} \
             -t ghcr.io/${{ env.OWNER_LC }}/quanheng-bench:latest \
             $(printf 'ghcr.io/${{ env.OWNER_LC }}/quanheng-bench@sha256:%s ' *)
 

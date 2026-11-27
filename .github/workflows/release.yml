@@ -1,68 +1,74 @@
 # .github/workflows/release.yml
+#
+# 语义化发布：只有推送 v* tag 时才发版（tag 应与 Cargo.toml 的 version 一致）。
+#   git tag v0.3.1 && git push origin v0.3.1
+#
+# 不再按 commit count 自动递增 —— b1/b5/b7 这类构建号对使用者没有语义，
+# 且会随仓库历史变化而漂移。
 
-name: Create Release and Update README
+name: Create Release
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（如 v0.3.1），必须已存在于仓库"
+        required: true
+
+permissions:
+  contents: write
 
 jobs:
   release:
-    # [skip ci] 防止版本提交触发自身的死循环
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get version from commit count
+      - name: Resolve release tag
         id: version
         run: |
-          commit_count=$(git rev-list --count HEAD)
+          if [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::tag must start with 'v' (got '$tag')"; exit 1 ;;
+          esac
           cargo_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
-          echo "tag=b${commit_count}" >> $GITHUB_OUTPUT
-          echo "cargo_version=${cargo_version}" >> $GITHUB_OUTPUT
+          if [ "v${cargo_version}" != "$tag" ]; then
+            echo "::warning::tag $tag != Cargo.toml version v${cargo_version}"
+          fi
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "cargo_version=$cargo_version" >> $GITHUB_OUTPUT
 
       - name: Set owner to lowercase
         run: echo "OWNER_LC=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
-      # 镜像 tag 跟随构建号，README 里的拉取命令保持最新
-      - name: Update README.md with new version
+      - name: Build release tarballs
         run: |
-          sed -i "s|\(ghcr.io/${{ env.OWNER_LC }}/quanheng-bench:\)[^ \`\"]*|\1${{ steps.version.outputs.tag }}|g" README.md
-
-      - name: Commit and push release metadata
-        run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add README.md
-          if ! git diff --staged --quiet; then
-            git commit -m "chore(release): update image tag to ${{ steps.version.outputs.tag }} [skip ci]"
-            git push
-          else
-            echo "No README changes to commit."
-          fi
+          ./build.sh -v "${{ steps.version.outputs.tag }}" -o ./dist
+          cd dist && sha256sum quanheng-bench-*.tar.gz > SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          name: Release ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
           body: |
-            ${{ github.event.head_commit.message }}
-
-            ---
-
             **Container image** (multi-arch: linux/amd64 + linux/arm64)
 
             ```bash
             docker pull ghcr.io/${{ env.OWNER_LC }}/quanheng-bench:${{ steps.version.outputs.tag }}
+            docker pull ghcr.io/${{ env.OWNER_LC }}/quanheng-bench:latest
             ```
 
             **Build from source**
@@ -70,19 +76,8 @@ jobs:
             ```bash
             cargo build --release   # -> target/release/quanheng
             ```
-          draft: false
-          prerelease: false
 
-      # 发布附件：双架构 tar 包 + SHA256（复用 build.sh，与本地构建一致）
-      - name: Build release tarballs
-        run: |
-          ./build.sh -v "${{ steps.version.outputs.tag }}" -o ./dist
-          cd dist && sha256sum quanheng-bench-*.tar.gz > SHA256SUMS
-
-      - name: Upload tarballs to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
+            Offline installers (both architectures) are attached below.
           files: |
             dist/quanheng-bench-*.tar.gz
             dist/SHA256SUMS
