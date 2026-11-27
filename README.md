@@ -1,9 +1,9 @@
 # QuanHeng-Bench
 
-[![CI](https://github.com/TimeMobius/quanheng-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/TimeMobius/quanheng-bench/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/TimeMobius/quanheng-bench?display_name=tag)](https://github.com/TimeMobius/quanheng-bench/releases)
+[![CI](https://github.com/TimeMobius/QuanHeng-Bench/actions/workflows/ci.yml/badge.svg)](https://github.com/TimeMobius/QuanHeng-Bench/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/TimeMobius/QuanHeng-Bench?display_name=tag)](https://github.com/TimeMobius/QuanHeng-Bench/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Image](https://img.shields.io/badge/ghcr.io-timemobius%2Fquanheng--bench-blue)](https://github.com/TimeMobius/quanheng-bench/pkgs/container/quanheng-bench)
+[![Image](https://img.shields.io/badge/ghcr.io-timemobius%2Fquanheng--bench-blue)](https://github.com/TimeMobius/QuanHeng-Bench/pkgs/container/quanheng-bench)
 
 **Zero-dependency, single-binary LLM inference load tester with a built-in baseline dashboard.**
 
