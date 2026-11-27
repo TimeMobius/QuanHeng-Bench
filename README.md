@@ -1,9 +1,9 @@
 # QuanHeng-Bench
 
-[![CI](https://github.com/diannaojiang/quanheng-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/diannaojiang/quanheng-bench/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/diannaojiang/quanheng-bench?display_name=tag)](https://github.com/diannaojiang/quanheng-bench/releases)
+[![CI](https://github.com/TimeMobius/quanheng-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/TimeMobius/quanheng-bench/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/TimeMobius/quanheng-bench?display_name=tag)](https://github.com/TimeMobius/quanheng-bench/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Image](https://img.shields.io/badge/ghcr.io-quanheng--bench-blue)](https://github.com/diannaojiang/quanheng-bench/pkgs/container/quanheng-bench)
+[![Image](https://img.shields.io/badge/ghcr.io-timemobius%2Fquanheng--bench-blue)](https://github.com/TimeMobius/quanheng-bench/pkgs/container/quanheng-bench)
 
 **Zero-dependency, single-binary LLM inference load tester with a built-in baseline dashboard.**
 
@@ -180,9 +180,9 @@ curl -s $B/api/status | jq '{running, progress}'
 **Pull from GitHub Container Registry** (multi-arch manifest — `docker` picks the right one):
 
 ```bash
-docker pull ghcr.io/diannaojiang/quanheng-bench:b1
+docker pull ghcr.io/timemobius/quanheng-bench:b1
 docker run -d --name quanheng-bench -p 3000:3000 -v "$PWD/data:/app/data" \
-  -e BASE_URL=http://192.0.2.10:8000 ghcr.io/diannaojiang/quanheng-bench:b1
+  -e BASE_URL=http://192.0.2.10:8000 ghcr.io/timemobius/quanheng-bench:b1
 ```
 
 **Or load an offline tarball** — releases also ship two single-arch tarballs with distinct
