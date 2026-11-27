@@ -180,9 +180,9 @@ curl -s $B/api/status | jq '{running, progress}'
 **Pull from GitHub Container Registry** (multi-arch manifest — `docker` picks the right one):
 
 ```bash
-docker pull ghcr.io/timemobius/quanheng-bench:b7
+docker pull ghcr.io/timemobius/quanheng-bench:v0.3.0
 docker run -d --name quanheng-bench -p 3000:3000 -v "$PWD/data:/app/data" \
-  -e BASE_URL=http://192.0.2.10:8000 ghcr.io/timemobius/quanheng-bench:b7
+  -e BASE_URL=http://192.0.2.10:8000 ghcr.io/timemobius/quanheng-bench:v0.3.0
 ```
 
 **Or load an offline tarball** — releases also ship two single-arch tarballs with distinct
