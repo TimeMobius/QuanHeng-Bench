@@ -462,7 +462,7 @@ export function compareOverlayPreset(entries, theme) {
       title: entry.model,
     }));
     datasets.push(lineDataset({
-      label: `${entry.model} · 输出速度`,
+      label: `${entry.model} · Decode t/s`,
       data: levels.map((level) => (byLevel.has(level) ? byLevel.get(level).avg_output_speed_tps : null)),
       color,
       dash: [5, 4],
@@ -473,10 +473,39 @@ export function compareOverlayPreset(entries, theme) {
     }));
   });
 
+  // 量纲约定（双轴图最容易被误读的地方，必须写死而不是交给 auto-scale）：
+  //   左轴 TTFT：从 0 起（截断的轴会让微小差异看起来像断崖），线性，
+  //              跨越两个数量级时改对数，否则低并发段被压成一条线；
+  //   右轴 Decode：从 0 起，线性，上限取数据最大值上浮 10%（避免贴顶）；
+  //   只让左轴画网格线，右轴不叠加第二套网格，否则读者分不清参照系；
+  //   同一模型的 TTFT 用实线+圆点、Decode 用虚线+无点，颜色只表模型、线型只表量纲。
+  const ttftValues = [];
+  const tpsValues = [];
+  entries.forEach((entry) => {
+    (entry.records || []).forEach((record) => {
+      if (Number.isFinite(record.avg_ttft_ms) && record.avg_ttft_ms > 0) ttftValues.push(record.avg_ttft_ms);
+      if (Number.isFinite(record.avg_output_speed_tps)) tpsValues.push(record.avg_output_speed_tps);
+    });
+  });
+  const ttftLog = ttftValues.length >= 2
+    && Math.max(...ttftValues) / Math.min(...ttftValues) >= 20;
+  const tpsMax = tpsValues.length ? Math.max(...tpsValues) : undefined;
+
+  const leftAxis = ttftLog
+    ? logScale(theme, { title: 'TTFT (ms，越低越好)' })
+    : valueScale(theme, { title: 'TTFT (ms，越低越好)', min: 0 });
+  const rightAxis = valueScale(theme, {
+    position: 'right',
+    title: 'Decode 输出速度 (t/s，越高越好)',
+    showGrid: false,
+    min: 0,
+    max: tpsMax === undefined ? undefined : Math.ceil(tpsMax * 1.1),
+  });
+
   return finalize(theme, { type: 'line', data: { labels, datasets } }, {
     x: categoryScale(theme, labels, '并发'),
-    y: valueScale(theme, { title: 'TTFT (ms)' }),
-    y1: valueScale(theme, { position: 'right', title: '输出速度 (t/s)', showGrid: false }),
+    y: leftAxis,
+    y1: rightAxis,
   });
 }
 

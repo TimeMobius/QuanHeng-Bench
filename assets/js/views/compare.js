@@ -9,7 +9,7 @@ import {
   fmtConcurrency, tokenParts,
 } from '../format.js';
 import {
-  mountChart, destroyCharts, compareMetricPreset, compareSuccessPreset, radarPreset,
+  mountChart, destroyCharts, compareOverlayPreset, compareSuccessPreset, radarPreset,
 } from '../charts.js';
 import { chartCard } from '../components/chart-card.js';
 import { createPopover } from '../components/popover.js';
@@ -270,12 +270,23 @@ function concurrencyTable() {
       render: (row) => {
         const record = entry.records.find((item) => item.concurrency === row.level);
         if (!record) return html`<span class="text-faint">—</span>`;
-        return html`<span class="cell-model" style="justify-content:flex-end;gap:6px">
-          <span class="cap-cell cap-cell--tight">
-            ${msValue(record.avg_ttft_ms)}
-            <span class="cell-sub">${tpsValue(record.avg_output_speed_tps)}</span>
+        // 每个并发档位同时给出 TTFT 与 Decode：两行都带标签，
+        // 避免只显示首 token 延迟而让人以为这一档没有解码吞吐数据。
+        return html`<span class="metric-pair">
+          <span class="metric-pair__row">
+            <span class="metric-pair__label">TTFT</span>
+            <span class="metric-pair__value">${msValue(record.avg_ttft_ms)}</span>
           </span>
-          <span class="badge badge--outline" title="成功率">${fmtPct(record.success_rate, 1)}</span>
+          <span class="metric-pair__row">
+            <span class="metric-pair__label">Decode</span>
+            <span class="metric-pair__value">${tpsValue(record.avg_output_speed_tps)}</span>
+          </span>
+          <span class="metric-pair__row">
+            <span class="metric-pair__label">成功率</span>
+            <span class="metric-pair__value">
+              <span class="badge badge--${successTone(record.success_rate)}">${fmtPct(record.success_rate, 1)}</span>
+            </span>
+          </span>
         </span>`;
       },
     })),
@@ -305,6 +316,15 @@ function radarData() {
  * 能力评分表：把雷达图背后的算式摊开，避免"归一化"变成黑箱。
  * 每行一个能力维度，列出算法与各模型的原始值 / 得分。
  */
+/** 成功率徽标配色：达标（≥95%）绿、可用（≥80%）黄、其余红。 */
+function successTone(rate) {
+  const value = Number(rate);
+  if (!Number.isFinite(value)) return 'outline';
+  if (value >= 95) return 'good';
+  if (value >= 80) return 'warn';
+  return 'bad';
+}
+
 function capabilityTable() {
   const columns = [
     {
@@ -365,20 +385,12 @@ function resultsBody(ctx) {
   return html`
     <div class="chart-grid">
       ${chartCard({
-        id: 'compare-ttft',
-        title: 'Prefill：TTFT 随并发',
-        subtitle: '首 token 延迟（ms，越低越好）· 每色一个模型',
-        ariaLabel: '所选模型各并发 TTFT 对比折线图',
+        id: 'compare-overlay',
+        title: 'TTFT 与 Decode 输出速度叠加',
+        subtitle: '实线 = TTFT（左轴 ms，越低越好）· 虚线 = Decode（右轴 t/s，越高越好）· 颜色只区分模型',
+        ariaLabel: '所选模型的 TTFT 与 Decode 输出速度随并发变化叠加图',
         wide: true,
-        filename: `compare-ttft-${currentDate}.png`,
-      })}
-      ${chartCard({
-        id: 'compare-decode',
-        title: 'Decode：输出速度随并发',
-        subtitle: '首字之后的解码速度（t/s，越高越好）· 每色一个模型',
-        ariaLabel: '所选模型各并发 Decode 输出速度对比折线图',
-        wide: true,
-        filename: `compare-decode-${currentDate}.png`,
+        filename: `compare-overlay-${currentDate}.png`,
       })}
       ${chartCard({
         id: 'compare-success',
@@ -422,7 +434,7 @@ function resultsBody(ctx) {
       <div class="card__head">
         <div class="card__titles">
           <h2 class="card__title">各并发明细</h2>
-          <p class="card__sub">上：TTFT（ms）· 下：Decode 输出速度（t/s）· 徽标为成功率</p>
+          <p class="card__sub">每个并发档位列出 TTFT（ms）、Decode 输出速度（t/s）与成功率</p>
         </div>
       </div>
       <div class="card__body card__body--flush" data-compare-levels>${concurrencyTable()}</div>
@@ -543,30 +555,9 @@ function refreshBody(root, ctx) {
 function mountCharts() {
   if (entries.length < 2) return;
   const rad = radarData();
-  mountChart('compare-ttft', (theme) => compareMetricPreset(entries, theme, {
-    key: 'avg_ttft_ms',
-    axisTitle: 'TTFT (ms)',
-    unit: 'ms',
-    log: ttftSpansDecades(entries),
-  }));
-  mountChart('compare-decode', (theme) => compareMetricPreset(entries, theme, {
-    key: 'avg_output_speed_tps',
-    axisTitle: 'Decode 输出速度 (t/s)',
-    unit: 'tps',
-  }));
+  mountChart('compare-overlay', (theme) => compareOverlayPreset(entries, theme));
   mountChart('compare-success', (theme) => compareSuccessPreset(entries, theme));
   mountChart('compare-radar', (theme) => radarPreset(rad.labels, rad.series, theme));
-}
-
-/** 各模型 TTFT 跨越两个数量级时改用对数轴，否则低并发段被压成一条线。 */
-function ttftSpansDecades(list) {
-  const values = [];
-  list.forEach((entry) => (entry.records || []).forEach((record) => {
-    const value = Number(record.avg_ttft_ms);
-    if (Number.isFinite(value) && value > 0) values.push(value);
-  }));
-  if (values.length < 2) return false;
-  return Math.max(...values) / Math.min(...values) >= 20;
 }
 
 export function bind(root, ctx) {
