@@ -503,6 +503,50 @@ export function compareSuccessPreset(entries, theme) {
   });
 }
 
+/**
+ * 对比：单指标多模型折线。
+ *
+ * 每个指标一张图（而不是双轴叠加），双轴会让两条不同量纲的曲线互相误导：
+ * 读者无法从"哪条线更高"判断优劣，因为左右轴各自独立缩放。
+ *
+ * spec: { key, axisTitle, unit, min?, max?, tickFormatter?, log? }
+ */
+export function compareMetricPreset(entries, theme, spec) {
+  const { key, axisTitle, unit = '', min, max, tickFormatter, log = false } = spec;
+  const levels = [];
+  entries.forEach((entry) => {
+    entry.records.forEach((record) => {
+      if (!levels.includes(record.concurrency)) levels.push(record.concurrency);
+    });
+  });
+  levels.sort((a, b) => a - b);
+  const labels = levels.map((level) => fmtConcurrency(level));
+
+  const datasets = entries.map((entry, index) => {
+    const byLevel = new Map(entry.records.map((record) => [record.concurrency, record]));
+    return lineDataset({
+      label: entry.model,
+      data: levels.map((level) => {
+        const record = byLevel.get(level);
+        const value = record ? Number(record[key]) : NaN;
+        return Number.isFinite(value) ? value : null;
+      }),
+      color: colorFor(theme, index),
+      unit,
+      title: entry.model,
+    });
+  });
+
+  const y = log
+    ? logScale(theme, { title: axisTitle, tickFormatter })
+    : valueScale(theme, { title: axisTitle, min, max, tickFormatter });
+
+  return finalize(theme, { type: 'line', data: { labels, datasets } }, {
+    x: categoryScale(theme, labels, '并发'),
+    y,
+  });
+}
+
 /** 对比：归一化雷达图（0–100，越高越好；TTFT 已取倒数归一）。 */
 export function radarPreset(labels, series, theme) {
   const datasets = series.map((item, index) => {

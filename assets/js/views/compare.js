@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// views/compare.js — 多模型对比：勾选（≥2）、TTFT/吞吐叠加、归一化雷达、并排指标表
+// views/compare.js — 多模型对比：勾选（≥2）、Prefill/Decode 分图、能力雷达、能力评分表
 // ---------------------------------------------------------------------------
 
 import { html, raw, setHtml } from '../dom.js';
@@ -9,7 +9,7 @@ import {
   fmtConcurrency, tokenParts,
 } from '../format.js';
 import {
-  mountChart, destroyCharts, compareOverlayPreset, compareSuccessPreset, radarPreset,
+  mountChart, destroyCharts, compareMetricPreset, compareSuccessPreset, radarPreset,
 } from '../charts.js';
 import { chartCard } from '../components/chart-card.js';
 import { createPopover } from '../components/popover.js';
@@ -34,13 +34,129 @@ const SUMMARY_METRICS = [
   { key: 'max_concurrency', label: '最大并发', unit: 'concurrency' },
 ];
 
-const RADAR_METRICS = [
-  { key: 'avg_ttft_ms', label: 'TTFT（越低越好）', lower: true },
-  { key: 'p95_ttft_ms', label: 'P95（越低越好）', lower: true },
-  { key: 'avg_output_speed_tps', label: '输出速度', lower: false },
-  { key: 'avg_tps', label: '整体吞吐', lower: false },
-  { key: 'success_rate', label: '成功率', lower: false },
+/**
+ * 雷达图表示「能力」而不是「指标」。
+ *
+ * 直接拿 TTFT / P95 / 输出速度 画雷达有两个问题：量纲不同、方向不同，
+ * 而且 P95 与 TTFT 高度相关（同一个维度的两倍权重）。
+ *
+ * 这里把一次压测拆成五个正交能力，各自换算成 0–100 分：
+ *
+ *   Prefill  首 token 能力：prefill 越快分越高（TTFT 取对数）
+ *   Decode   持续解码能力：首字之后的输出速度
+ *   并发承载 稳定承载能力：成功率仍达标（≥95%）的最高并发级别
+ *   综合吞吐 端到端产能：整体 token 吞吐（含排队与首字时间）
+ *   成功率   请求可靠性
+ *
+ * 归一化采用**固定锚点**而非所选模型间的 min/max。相对归一化会让
+ * "每次都有某个模型拿 100 分"，不同批次挑选模型时分值不可比；
+ * 固定锚点的分数在任何对比组合下都稳定。
+ */
+const CONCURRENCY_SLO = 95; // 成功率达标线（%），用于判定「稳定承载的最高并发」
+
+const CAPABILITIES = [
+  {
+    key: 'prefill',
+    label: 'Prefill',
+    hint: '首 token 能力',
+    formula: '100 − 40·log10(TTFT / 100ms)，夹取 0–100',
+    raw: (entry) => entry.summary.avg_ttft_ms,
+    rawText: (value) => (Number.isFinite(value) ? fmtMs(value) : '—'),
+  },
+  {
+    key: 'decode',
+    label: 'Decode',
+    hint: '持续解码能力',
+    formula: '50 + 50·log10(首字后 TPS / 10)，夹取 0–100',
+    raw: (entry) => entry.summary.avg_output_speed_tps,
+    rawText: (value) => (Number.isFinite(value) ? fmtTps(value) : '—'),
+  },
+  {
+    key: 'concurrency',
+    label: '并发承载',
+    hint: '成功率 ≥95% 的最高并发',
+    formula: '100 · log2(级别) / log2(日期内最高级别)',
+    raw: (entry) => stableConcurrency(entry),
+    rawText: (value) => (Number.isFinite(value) && value > 0 ? fmtConcurrency(value) : '—'),
+  },
+  {
+    key: 'throughput',
+    label: '综合吞吐',
+    hint: '端到端产能',
+    formula: '50 + 50·log10(整体 TPS / 10)，夹取 0–100',
+    raw: (entry) => entry.summary.avg_tps,
+    rawText: (value) => (Number.isFinite(value) ? fmtTps(value) : '—'),
+  },
+  {
+    key: 'success',
+    label: '成功率',
+    hint: '请求可靠性',
+    formula: '成功率百分比直接作为得分',
+    raw: (entry) => entry.summary.success_rate,
+    rawText: (value) => (Number.isFinite(value) ? fmtPct(value, 1) : '—'),
+  },
 ];
+
+/** 成功率仍达标（≥95%）的最高并发级别；全部达标时取记录里的最高级。 */
+function stableConcurrency(entry) {
+  const usable = (entry.records || [])
+    .filter((record) => Number(record.request_count) > 0)
+    .slice()
+    .sort((a, b) => a.concurrency - b.concurrency);
+  if (!usable.length) return null;
+  let best = null;
+  usable.forEach((record) => {
+    if (Number(record.success_rate) >= CONCURRENCY_SLO) best = record.concurrency;
+  });
+  return best;
+}
+
+const clamp = (value, lo = 0, hi = 100) => Math.min(hi, Math.max(lo, value));
+
+/** 能力 → 0–100 分（固定锚点，见 CAPABILITIES 注释）。 */
+function capabilityScore(key, entry) {
+  switch (key) {
+    case 'prefill': {
+      const ttft = entry.summary.avg_ttft_ms;
+      if (!Number.isFinite(ttft) || ttft <= 0) return null;
+      return clamp(100 - 40 * Math.log10(ttft / 100));
+    }
+    case 'decode': {
+      const tps = entry.summary.avg_output_speed_tps;
+      if (!Number.isFinite(tps) || tps <= 0) return null;
+      return clamp(50 + 50 * Math.log10(tps / 10));
+    }
+    case 'throughput': {
+      const tps = entry.summary.avg_tps;
+      if (!Number.isFinite(tps) || tps <= 0) return null;
+      return clamp(50 + 50 * Math.log10(tps / 10));
+    }
+    case 'success': {
+      const rate = entry.summary.success_rate;
+      return Number.isFinite(rate) ? clamp(rate) : null;
+    }
+    case 'concurrency': {
+      const level = stableConcurrency(entry);
+      if (!level) return null;
+      const ceiling = concurrencyCeiling();
+      if (!ceiling) return null;
+      return clamp((100 * Math.log2(level)) / Math.log2(ceiling));
+    }
+    default:
+      return null;
+  }
+}
+
+/** 归一化分母：当天数据里出现过的最高并发级别（跨模型固定，保证分数可比）。 */
+function concurrencyCeiling() {
+  let ceiling = 0;
+  entries.forEach((entry) => {
+    (entry.records || []).forEach((record) => {
+      if (Number(record.request_count) > 0) ceiling = Math.max(ceiling, Number(record.concurrency) || 0);
+    });
+  });
+  return ceiling;
+}
 
 let selection = [];
 let entries = [];
@@ -155,7 +271,10 @@ function concurrencyTable() {
         const record = entry.records.find((item) => item.concurrency === row.level);
         if (!record) return html`<span class="text-faint">—</span>`;
         return html`<span class="cell-model" style="justify-content:flex-end;gap:6px">
-          ${msValue(record.avg_ttft_ms)}
+          <span class="cap-cell cap-cell--tight">
+            ${msValue(record.avg_ttft_ms)}
+            <span class="cell-sub">${tpsValue(record.avg_output_speed_tps)}</span>
+          </span>
           <span class="badge badge--outline" title="成功率">${fmtPct(record.success_rate, 1)}</span>
         </span>`;
       },
@@ -165,40 +284,67 @@ function concurrencyTable() {
   return renderTable({
     columns,
     rows,
-    ariaLabel: '所选模型各并发 TTFT 对比',
+    ariaLabel: '所选模型各并发 TTFT 与 Decode 输出速度对比',
     emptyText: '暂无可对比的并发记录',
   });
 }
 
 function radarData() {
-  const labels = RADAR_METRICS.map((metric) => metric.label);
-  const series = entries.map((entry) => ({ label: entry.model, data: [] }));
-
-  RADAR_METRICS.forEach((metric, metricIndex) => {
-    const values = entries.map((entry) => {
-      const value = entry.summary[metric.key];
-      return Number.isFinite(value) ? value : null;
-    });
-    const usable = values.filter((value) => value !== null);
-    const min = usable.length ? Math.min(...usable) : 0;
-    const max = usable.length ? Math.max(...usable) : 0;
-    const range = max - min;
-
-    values.forEach((value, entryIndex) => {
-      if (value === null) {
-        series[entryIndex].data[metricIndex] = 0;
-        return;
-      }
-      if (range === 0) {
-        series[entryIndex].data[metricIndex] = 100;
-        return;
-      }
-      const normalized = metric.lower ? (max - value) / range : (value - min) / range;
-      series[entryIndex].data[metricIndex] = Math.round((15 + 85 * normalized) * 10) / 10;
-    });
-  });
-
+  const labels = CAPABILITIES.map((capability) => capability.label);
+  const series = entries.map((entry) => ({
+    label: entry.model,
+    data: CAPABILITIES.map((capability) => {
+      const score = capabilityScore(capability.key, entry);
+      return score === null ? 0 : Math.round(score * 10) / 10;
+    }),
+  }));
   return { labels, series };
+}
+
+/**
+ * 能力评分表：把雷达图背后的算式摊开，避免"归一化"变成黑箱。
+ * 每行一个能力维度，列出算法与各模型的原始值 / 得分。
+ */
+function capabilityTable() {
+  const columns = [
+    {
+      key: 'capability',
+      label: '能力',
+      align: 'left',
+      render: (row) => html`
+        <span class="cap-cell">
+          <strong>${row.label}</strong>
+          <span class="cell-sub">${row.hint}</span>
+        </span>`,
+    },
+    {
+      key: 'formula',
+      label: '换算方式',
+      align: 'left',
+      render: (row) => html`<span class="cell-sub cell-sub--mono">${row.formula}</span>`,
+    },
+    ...entries.map((entry) => ({
+      key: entry.model,
+      label: entry.model,
+      sortable: false,
+      render: (row) => {
+        const score = capabilityScore(row.key, entry);
+        const rawValue = row.raw(entry);
+        const rawText = row.rawText(rawValue);
+        return html`<span class="cell-model" style="justify-content:flex-end;gap:6px">
+          <span class="${score !== null ? 'num-strong' : 'text-faint'}">${score === null ? '—' : fmtFixed(score, 1)}</span>
+          <span class="cell-sub">${rawText}</span>
+        </span>`;
+      },
+    })),
+  ];
+
+  return renderTable({
+    columns,
+    rows: CAPABILITIES,
+    ariaLabel: '能力维度换算方式与各模型得分',
+    emptyText: '暂无数据',
+  });
 }
 
 function resultsBody(ctx) {
@@ -219,12 +365,20 @@ function resultsBody(ctx) {
   return html`
     <div class="chart-grid">
       ${chartCard({
-        id: 'compare-overlay',
-        title: 'TTFT 与输出速度叠加',
-        subtitle: '实线 = TTFT（左轴 ms）· 虚线 = 输出速度（右轴 t/s）· 每色一个模型',
-        ariaLabel: '所选模型的 TTFT 与输出速度随并发变化叠加图',
+        id: 'compare-ttft',
+        title: 'Prefill：TTFT 随并发',
+        subtitle: '首 token 延迟（ms，越低越好）· 每色一个模型',
+        ariaLabel: '所选模型各并发 TTFT 对比折线图',
         wide: true,
-        filename: `compare-overlay-${currentDate}.png`,
+        filename: `compare-ttft-${currentDate}.png`,
+      })}
+      ${chartCard({
+        id: 'compare-decode',
+        title: 'Decode：输出速度随并发',
+        subtitle: '首字之后的解码速度（t/s，越高越好）· 每色一个模型',
+        ariaLabel: '所选模型各并发 Decode 输出速度对比折线图',
+        wide: true,
+        filename: `compare-decode-${currentDate}.png`,
       })}
       ${chartCard({
         id: 'compare-success',
@@ -235,12 +389,24 @@ function resultsBody(ctx) {
       })}
       ${chartCard({
         id: 'compare-radar',
-        title: '归一化雷达',
-        subtitle: '每项按所选模型 min/max 归一（15–100）· TTFT/P95 取倒数',
-        ariaLabel: '所选模型综合能力归一化雷达图',
+        title: '能力雷达',
+        subtitle: 'Prefill / Decode / 并发承载 / 综合吞吐 / 成功率 · 0–100 分，固定锚点换算',
+        ariaLabel: '所选模型五项能力得分雷达图',
         filename: `compare-radar-${currentDate}.png`,
       })}
     </div>
+
+    <section class="card">
+      <div class="card__head">
+        <div class="card__titles">
+          <h2 class="card__title">能力评分与算法</h2>
+          <p class="card__sub">
+            左侧为 0–100 分，右侧灰字为该项原始测量值；固定锚点换算，不同对比组合下分数可比
+          </p>
+        </div>
+      </div>
+      <div class="card__body card__body--flush" data-compare-capability>${capabilityTable()}</div>
+    </section>
 
     <section class="card">
       <div class="card__head">
@@ -255,8 +421,8 @@ function resultsBody(ctx) {
     <section class="card">
       <div class="card__head">
         <div class="card__titles">
-          <h2 class="card__title">各并发 TTFT</h2>
-          <p class="card__sub">括号内为成功率</p>
+          <h2 class="card__title">各并发明细</h2>
+          <p class="card__sub">上：TTFT（ms）· 下：Decode 输出速度（t/s）· 徽标为成功率</p>
         </div>
       </div>
       <div class="card__body card__body--flush" data-compare-levels>${concurrencyTable()}</div>
@@ -348,7 +514,7 @@ export function render(ctx) {
       ${viewHead({
         title: html`多模型对比`,
         badge: html`<span class="badge badge--outline">${fmtDateLabel(currentDate)}</span>`,
-        sub: ['勾选 2–6 个模型，叠加 TTFT / 吞吐曲线，并查看归一化雷达与并排指标'],
+        sub: ['勾选 2–6 个模型，分别对比 Prefill（TTFT）与 Decode（输出速度），并按能力维度看综合表现'],
       })}
       ${controls(ctx)}
       <div data-compare-body>${resultsBody(ctx)}</div>
@@ -377,9 +543,30 @@ function refreshBody(root, ctx) {
 function mountCharts() {
   if (entries.length < 2) return;
   const rad = radarData();
-  mountChart('compare-overlay', (theme) => compareOverlayPreset(entries, theme));
+  mountChart('compare-ttft', (theme) => compareMetricPreset(entries, theme, {
+    key: 'avg_ttft_ms',
+    axisTitle: 'TTFT (ms)',
+    unit: 'ms',
+    log: ttftSpansDecades(entries),
+  }));
+  mountChart('compare-decode', (theme) => compareMetricPreset(entries, theme, {
+    key: 'avg_output_speed_tps',
+    axisTitle: 'Decode 输出速度 (t/s)',
+    unit: 'tps',
+  }));
   mountChart('compare-success', (theme) => compareSuccessPreset(entries, theme));
   mountChart('compare-radar', (theme) => radarPreset(rad.labels, rad.series, theme));
+}
+
+/** 各模型 TTFT 跨越两个数量级时改用对数轴，否则低并发段被压成一条线。 */
+function ttftSpansDecades(list) {
+  const values = [];
+  list.forEach((entry) => (entry.records || []).forEach((record) => {
+    const value = Number(record.avg_ttft_ms);
+    if (Number.isFinite(value) && value > 0) values.push(value);
+  }));
+  if (values.length < 2) return false;
+  return Math.max(...values) / Math.min(...values) >= 20;
 }
 
 export function bind(root, ctx) {
