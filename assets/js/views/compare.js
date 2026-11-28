@@ -10,6 +10,7 @@ import {
 } from '../format.js';
 import {
   mountChart, destroyCharts, compareOverlayPreset, compareSuccessPreset, radarPreset,
+  hasPrefillData,
 } from '../charts.js';
 import { chartCard } from '../components/chart-card.js';
 import { createPopover } from '../components/popover.js';
@@ -367,6 +368,27 @@ function capabilityTable() {
   });
 }
 
+/**
+ * 左轴口径：有 input_tokens（protocol v2）就画 Prefill 有效吞吐，
+ * 否则回退到 TTFT —— 历史 v1 记录没有输入 token 数，硬算会得出 0。
+ */
+function leftMetric() {
+  return hasPrefillData(entries) ? 'prefill' : 'ttft';
+}
+
+function overlayTitle() {
+  return leftMetric() === 'prefill'
+    ? 'Prefill 与 Decode 吞吐叠加'
+    : 'TTFT 与 Decode 输出速度叠加';
+}
+
+function overlaySubtitle() {
+  if (leftMetric() === 'prefill') {
+    return '实线 = Prefill 有效吞吐（输入 token ÷ TTFT）· 虚线 = Decode · 统一 t/s，对数刻度 · 均含排队与网络时间';
+  }
+  return '实线 = TTFT（左轴 ms，越低越好）· 虚线 = Decode（右轴 t/s）· 该日期为 protocol v1 记录，无输入 token 数，无法换算 Prefill 吞吐';
+}
+
 function resultsBody(ctx) {
   if (entries.length < 2) {
     return html`
@@ -386,9 +408,9 @@ function resultsBody(ctx) {
     <div class="chart-grid">
       ${chartCard({
         id: 'compare-overlay',
-        title: 'TTFT 与 Decode 输出速度叠加',
-        subtitle: '实线 = TTFT（左轴 ms，越低越好）· 虚线 = Decode（右轴 t/s，越高越好）· 颜色只区分模型',
-        ariaLabel: '所选模型的 TTFT 与 Decode 输出速度随并发变化叠加图',
+        title: overlayTitle(),
+        subtitle: overlaySubtitle(),
+        ariaLabel: '所选模型预填充与解码吞吐随并发变化叠加图',
         wide: true,
         filename: `compare-overlay-${currentDate}.png`,
       })}
@@ -526,7 +548,7 @@ export function render(ctx) {
       ${viewHead({
         title: html`多模型对比`,
         badge: html`<span class="badge badge--outline">${fmtDateLabel(currentDate)}</span>`,
-        sub: ['勾选 2–6 个模型，分别对比 Prefill（TTFT）与 Decode（输出速度），并按能力维度看综合表现'],
+        sub: ['勾选 2–6 个模型，对比预填充与解码吞吐随并发的表现，并按能力维度看综合实力'],
       })}
       ${controls(ctx)}
       <div data-compare-body>${resultsBody(ctx)}</div>
@@ -555,7 +577,8 @@ function refreshBody(root, ctx) {
 function mountCharts() {
   if (entries.length < 2) return;
   const rad = radarData();
-  mountChart('compare-overlay', (theme) => compareOverlayPreset(entries, theme));
+  const left = leftMetric();
+  mountChart('compare-overlay', (theme) => compareOverlayPreset(entries, theme, { left }));
   mountChart('compare-success', (theme) => compareSuccessPreset(entries, theme));
   mountChart('compare-radar', (theme) => radarPreset(rad.labels, rad.series, theme));
 }

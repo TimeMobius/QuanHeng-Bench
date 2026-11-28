@@ -438,7 +438,31 @@ export function modelsBarPreset(models, theme) {
 }
 
 /** 对比：TTFT（左轴 ms，实线）叠加输出速度（右轴 t/s，虚线），每个模型一色。 */
-export function compareOverlayPreset(entries, theme) {
+/**
+ * 左轴口径：把 TTFT 换算成「Prefill 有效吞吐」= input_tokens / TTFT。
+ *
+ * 为什么值得换：右轴是 Decode 吞吐（t/s），左轴若也是 t/s，双轴就变成
+ * 同一量纲的两个维度（预填充 vs 解码），读者不用在两套单位之间换算。
+ *
+ * 代价与前提（必须在 UI 里说清楚）：
+ *   - TTFT 含排队与网络，所以这是「有效」预填充速率，不是纯算力；
+ *   - 需要 input_tokens，只有 protocol v2 记录才有；v1 记录该项为 0，
+ *     此时调用方应回退到 TTFT 口径。
+ */
+export function prefillTps(record) {
+  const inputTokens = Number(record && record.input_tokens);
+  const ttft = Number(record && record.avg_ttft_ms);
+  if (!Number.isFinite(inputTokens) || inputTokens <= 0) return null;
+  if (!Number.isFinite(ttft) || ttft <= 0) return null;
+  return inputTokens / (ttft / 1000);
+}
+
+/** 所选模型是否具备计算 Prefill 吞吐的数据（protocol v2 + 有输入 token 数）。 */
+export function hasPrefillData(entries) {
+  return entries.some((entry) => (entry.records || []).some((record) => prefillTps(record) !== null));
+}
+
+export function compareOverlayPreset(entries, theme, options = {}) {
   const levels = [];
   entries.forEach((entry) => {
     entry.records.forEach((record) => {
@@ -452,45 +476,78 @@ export function compareOverlayPreset(entries, theme) {
   entries.forEach((entry, index) => {
     const color = colorFor(theme, index);
     const byLevel = new Map(entry.records.map((record) => [record.concurrency, record]));
+    const leftIsPrefill = options.left !== 'ttft';
     datasets.push(lineDataset({
-      label: `${entry.model} · TTFT`,
-      data: levels.map((level) => (byLevel.has(level) ? byLevel.get(level).avg_ttft_ms : null)),
+      label: `${entry.model} · ${leftIsPrefill ? 'Prefill' : 'TTFT'}`,
+      data: levels.map((level) => {
+        const record = byLevel.get(level);
+        if (!record) return null;
+        if (!leftIsPrefill) return Number(record.avg_ttft_ms);
+        const value = prefillTps(record);
+        return value === null ? null : Math.round(value * 10) / 10;
+      }),
       color,
       fill: false,
-      unit: 'ms',
+      unit: leftIsPrefill ? 'tps' : 'ms',
       axis: 'y',
       title: entry.model,
     }));
-    datasets.push(lineDataset({
-      label: `${entry.model} · Decode t/s`,
-      data: levels.map((level) => (byLevel.has(level) ? byLevel.get(level).avg_output_speed_tps : null)),
-      color,
-      dash: [5, 4],
-      showPoints: false,
-      unit: 'tps',
-      axis: 'y1',
-      title: entry.model,
-    }));
+    if (leftIsPrefill) {
+      // 同为 t/s：并到左轴，用对数刻度同时容纳 ~50 与 ~1000 t/s。
+      // 分成两根轴会让 Decode 虚线看起来像 Prefill 实线的"影子"，
+      // 而两条轴各自动缩放时，线的相对高低不携带任何信息。
+      datasets.push(lineDataset({
+        label: `${entry.model} · Decode`,
+        data: levels.map((level) => {
+          const record = byLevel.get(level);
+          const value = record ? Number(record.avg_output_speed_tps) : NaN;
+          return Number.isFinite(value) && value > 0 ? value : null;
+        }),
+        color,
+        dash: [5, 4],
+        showPoints: false,
+        unit: 'tps',
+        axis: 'y',
+        title: entry.model,
+      }));
+    } else {
+      datasets.push(lineDataset({
+        label: `${entry.model} · Decode t/s`,
+        data: levels.map((level) => (byLevel.has(level) ? byLevel.get(level).avg_output_speed_tps : null)),
+        color,
+        dash: [5, 4],
+        showPoints: false,
+        unit: 'tps',
+        axis: 'y1',
+        title: entry.model,
+      }));
+    }
   });
 
-  // 量纲约定（双轴图最容易被误读的地方，必须写死而不是交给 auto-scale）：
-  //   左轴 TTFT：从 0 起（截断的轴会让微小差异看起来像断崖），线性，
-  //              跨越两个数量级时改对数，否则低并发段被压成一条线；
-  //   右轴 Decode：从 0 起，线性，上限取数据最大值上浮 10%（避免贴顶）；
-  //   只让左轴画网格线，右轴不叠加第二套网格，否则读者分不清参照系；
-  //   同一模型的 TTFT 用实线+圆点、Decode 用虚线+无点，颜色只表模型、线型只表量纲。
-  const ttftValues = [];
-  const tpsValues = [];
-  entries.forEach((entry) => {
-    (entry.records || []).forEach((record) => {
-      if (Number.isFinite(record.avg_ttft_ms) && record.avg_ttft_ms > 0) ttftValues.push(record.avg_ttft_ms);
-      if (Number.isFinite(record.avg_output_speed_tps)) tpsValues.push(record.avg_output_speed_tps);
+  // TTFT 模式才是真正的"两种量纲"（ms vs t/s），交给双轴版本；
+  // Prefill 模式下两条线同为 t/s，用一根对数轴，避免双轴相对高低失去意义。
+  if (options.left === 'ttft') {
+    const ttftValues = [];
+    entries.forEach((entry) => {
+      (entry.records || []).forEach((record) => {
+        if (Number.isFinite(record.avg_ttft_ms) && record.avg_ttft_ms > 0) ttftValues.push(record.avg_ttft_ms);
+      });
     });
+    return ttftOverlay(theme, labels, datasets, ttftValues);
+  }
+
+  return finalize(theme, { type: 'line', data: { labels, datasets } }, {
+    x: categoryScale(theme, labels, '并发'),
+    y: logScale(theme, {
+      title: '吞吐 (t/s，对数)',
+    }),
   });
+}
+
+/** 左轴用 TTFT 时的双轴版本（两种量纲 ms 与 t/s，必须分开画）。 */
+function ttftOverlay(theme, labels, datasets, ttftValues) {
   const ttftLog = ttftValues.length >= 2
     && Math.max(...ttftValues) / Math.min(...ttftValues) >= 20;
-  const tpsMax = tpsValues.length ? Math.max(...tpsValues) : undefined;
-
   const leftAxis = ttftLog
     ? logScale(theme, { title: 'TTFT (ms，越低越好)' })
     : valueScale(theme, { title: 'TTFT (ms，越低越好)', min: 0 });
@@ -499,9 +556,7 @@ export function compareOverlayPreset(entries, theme) {
     title: 'Decode 输出速度 (t/s，越高越好)',
     showGrid: false,
     min: 0,
-    max: tpsMax === undefined ? undefined : Math.ceil(tpsMax * 1.1),
   });
-
   return finalize(theme, { type: 'line', data: { labels, datasets } }, {
     x: categoryScale(theme, labels, '并发'),
     y: leftAxis,
