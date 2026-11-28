@@ -20,8 +20,10 @@ services:
       - STREAM_INCLUDE_USAGE=${STREAM_INCLUDE_USAGE:-auto}
       # Protocol v2: defeat prefix KV caching (head nonce + per-level rotation)
       - CACHE_BUST=${CACHE_BUST:-1}
-      # Discarded warm-up requests per (model, level); cache-bust only
+      # One-off warm-up per model (concurrency 1, excluded from timing/stats)
       - WARMUP_REQUESTS=${WARMUP_REQUESTS:-2}
+      # Minimum waves per level, so saturation can be judged
+      - MIN_WAVES=${MIN_WAVES:-2}
       # Target input length in tokens (0 = question bank as-is)
       - INPUT_TOKENS=${INPUT_TOKENS:-0}
       # Output token budget (0 = use MAX_TOKENS)

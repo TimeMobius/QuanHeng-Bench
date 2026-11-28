@@ -12,26 +12,28 @@ QuanHeng-Bench 是一个 Rust 编写的 LLM API 性能测试与可视化工具�
 2. **协商 usage 能力**（`STREAM_INCLUDE_USAGE=auto` 时）：一次性廉价探针（`max_tokens=1` + 请求 usage），
    成功则本进程内所有请求都带 `stream_options.include_usage`（精确 token）；
    网关 4xx 拒绝未知字段则回落估算口径。结果写入 `endpoint_capabilities`，跨重启复用。
-3. 从内置 510 题题库中随机抽题——**每个并发级别独立抽一组**（跨级别不复用，配合 nonce 破坏前缀缓存）
-4. 对**每个模型**并行执行测试（模型间并发；`MAX_PARALLEL_MODELS` 限制同时测试的模型数，默认 8）
-5. 每个模型依次在 7 个并发级别（1/2/4/8/16/32/64）下测试
-6. 每个并发级别跑 `TEST_RUNS` 轮取平均值
-7. 每轮请求数 = `max(band(并发), REQUESTS_PER_LEVEL)`，
+3. **模型级预热**：以单并发跑 `WARMUP_REQUESTS` 个请求，结果完全丢弃（不计时/不统计/不写库），
+   只吸收一次性的冷启动开销（权重加载、CUDA graph 捕获、kernel 编译）
+4. 从内置 510 题题库中随机抽题——**每个并发级别独立抽一组**（跨级别不复用，配合 nonce 破坏前缀缓存）
+5. 对**每个模型**并行执行测试（模型间并发；`MAX_PARALLEL_MODELS` 限制同时测试的模型数，默认 8）
+6. 每个模型依次在 7 个并发级别（1/2/4/8/16/32/64）下测试
+7. 每个并发级别跑 `TEST_RUNS` 轮取平均值
+8. 每轮请求数 = `max(band(并发), REQUESTS_PER_LEVEL)`，
    band = 并发×3（≤4）/ 并发×2（≤16）/ 并发×1（>16），保证低并发也有足够样本算 P99；
-   另加 `WARMUP_REQUESTS` 个预热请求，其结果**丢弃不进统计**（排除 CUDA graph / 引擎排队冷启动噪声）
-8. **构造 prompt**：按 `INPUT_TOKENS` 目标长度填充或截断题目；`CACHE_BUST=1` 时在 prompt **头部**
+   另保证至少 `MIN_WAVES` 波样本（请求数 ≥ MIN_WAVES × 并发），供饱和判定使用
+9. **构造 prompt**：按 `INPUT_TOKENS` 目标长度填充或截断题目；`CACHE_BUST=1` 时在 prompt **头部**
    插入唯一 nonce（`# qh-<epoch>-<seq>`）——前缀 KV 缓存从头匹配，头部不同即全 prompt 不可复用。
    nonce 必须放头部，放尾部无效。
-9. 流式解析 SSE 响应：**按行缓冲**（跨网络 chunk 的半行不会丢），捕获 `usage.completion_tokens` 算精确 TPS；
+10. 流式解析 SSE 响应：**按行缓冲**（跨网络 chunk 的半行不会丢），捕获 `usage.completion_tokens` 算精确 TPS；
    服务器不返回 usage 时按字符估算（CJK 1 字≈1 token，其他非空白 ~4 字符/token）
-10. 记录 TTFT（首 token，检测 `reasoning`/`reasoning_content`/`content` 三个字段）
-11. 输出速度分两口径：首字后输出速度、整体吞吐
-12. 失败请求单独计数，并按错误摘要聚合（`error_count` / `error_summary`，只落库最多 5 类）
-13. 结果写入 SQLite（`test_records`），每条记录带 **token 口径元数据**：
+11. 记录 TTFT（首 token，检测 `reasoning`/`reasoning_content`/`content` 三个字段）
+12. 输出速度分两口径：首字后输出速度、整体吞吐
+13. 失败请求单独计数，并按错误摘要聚合（`error_count` / `error_summary`，只落库最多 5 类）
+14. 结果写入 SQLite（`test_records`），每条记录带 **token 口径元数据**：
     `input_tokens` / `output_tokens`（每请求均值）、`token_source`（`usage` 实测 / `estimate` 估算）、
     `protocol_version`（`2`；历史 v1 数据为 `1`）、`cache_bust`。每次运行写一条 `run_log`
-14. 运行中可通过 `POST /api/cancel` 取消（请求级检查，≤250ms 生效，未完成的并发级别不落库）
-15. Web 页面实时展示：概览 / 模型详情 / 多模型对比 / 跨日期趋势 / 运行记录
+15. 运行中可通过 `POST /api/cancel` 取消（请求级检查，≤250ms 生效，未完成的并发级别不落库）
+16. Web 页面实时展示：概览 / 模型详情 / 多模型对比 / 跨日期趋势 / 运行记录
 
 ### 测量协议（protocol v2）
 
@@ -42,7 +44,7 @@ QuanHeng-Bench 是一个 Rust 编写的 LLM API 性能测试与可视化工具�
 | token 来源 | 默认不请求 usage，纯字符估算 | auto 协商，能拿真实 usage 就拿 |
 | 前缀缓存 | 未处理，开缓存的服务器上多为缓存命中口径（TTFT 偏低） | 头部 nonce 绕过，测冷 prefill |
 | 抽题 | 全流程复用同一组题 | 每并发级别独立抽题 |
-| 预热 | 无 | `WARMUP_REQUESTS` 丢弃 |
+| 预热 | 无 | 模型级单并发预热，独立阶段、不计时不计统计 |
 | 输入/输出规模 | 题库题目随机长度 + `MAX_TOKENS` | `INPUT_TOKENS` / `OUTPUT_TOKENS` 固定坐标 |
 | 记录标记 | 无 | `protocol_version` / `token_source` / `cache_bust` |
 
@@ -87,13 +89,14 @@ QuanHeng-Bench 是一个 Rust 编写的 LLM API 性能测试与可视化工具�
 | `MODELS_CACHE_SECS` | `60` | `/v1/models` 列表缓存秒数（`/api/models?refresh=1` 可强制刷新） |
 | `STREAM_INCLUDE_USAGE` | `auto` | `auto`（默认）= 每次运行前一次性探测端点是否支持 `stream_options.include_usage`，支持则精确 usage、4xx 拒绝则回落估算，结果持久化到 `endpoint_capabilities`；`true` 强制发送；`false` 从不发送 |
 | `CACHE_BUST` | `true` | 前缀缓存绕过：每个请求在 prompt 头部插入唯一 nonce + 按并发级别轮换抽题。关闭则为 v1 口径（含缓存命中，TTFT 偏低） |
-| `WARMUP_REQUESTS` | `2` | 每个（模型, 并发级别）测量窗口前丢弃的预热请求数；仅 `CACHE_BUST=1` 时生效 |
+| `WARMUP_REQUESTS` | `2` | **模型级**一次性预热请求数（单并发），在所有档位测量之前跑完；完全不计时、不计统计、不写库。各并发档不再预热 |
+| `MIN_WAVES` | `2` | 每档最少波数（请求数 ≥ MIN_WAVES × 并发）。饱和判定靠「实测墙钟 ÷ (波数 × 单请求墙钟)」，单波无法判定 |
 | `INPUT_TOKENS` | `0` | 目标输入长度（token）。`0` = 直接用题库题目；>0 时按 `token × 4` 字符填充/截断（无 tokenizer，偏差约 ±15%） |
 | `OUTPUT_TOKENS` | `0` | 输出 token 预算；`0` = 用 `MAX_TOKENS`。同时决定请求体 `max_tokens` |
 | `CORS_ORIGINS` | (空) | 逗号分隔的允许来源；为空 = 仅同源（不再 `allow_origin(Any)`） |
 | `RUN_ON_START` | `true` | 启动时若当天无数据则自动跑一次；本地调试建议 `false` |
 | `ASSETS_DIR` | (自动探测) | 静态资源目录；依次探测 `ASSETS_DIR` → `./assets` → `/app/assets` → 源码树 |
-| `TEST_RUNS` | `1` | 每级测试轮数（取均值） |
+| `TEST_RUNS` | `2` | 每级测试轮数（取均值）。单轮只有 1 个样本，无法区分「真并行」和「只是还没排队」 |
 | `QUESTIONS_PER_RUN` | `20` | 每次随机抽题数 |
 | `MAX_TOKENS` | `512` | 模型输出最大 token |
 | `REQUEST_TIMEOUT_SECS` | `1800` | 单次请求超时 |

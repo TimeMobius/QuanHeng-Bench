@@ -119,14 +119,15 @@ All settings are environment variables (a YAML file is on the roadmap).
 | `DB_PATH` | `data/records.db` | SQLite file (auto-migrated on start) |
 | `CONCURRENCY_LEVELS` | `1,2,4,8,16,32,64` | Concurrency ladder |
 | `REQUESTS_PER_LEVEL` | `10` | Floor per level (`0` = ladder formula only) |
-| `TEST_RUNS` | `1` | Rounds per level, merged into one row |
+| `TEST_RUNS` | `2` | Rounds per level, merged into one row (one round gives a single sample — too few to tell "parallel" from "not queued yet") |
 | `QUESTIONS_PER_RUN` | `20` | Random prompts per run from the built-in bank |
 | `MAX_TOKENS` | `512` | Output cap per request |
 | `MAX_PARALLEL_MODELS` | `8` | Models tested simultaneously (1–32) |
 | `MODELS_CACHE_SECS` | `60` | `/v1/models` cache TTL |
 | `STREAM_INCLUDE_USAGE` | `auto` | `auto` probes the endpoint once per run and asks for exact `usage` if it is accepted (a 4xx rejection falls back to estimation); `true` always sends, `false` never does |
 | `CACHE_BUST` | `true` | Defeat prefix KV caching: unique nonce at the **head** of every prompt + a fresh question set per concurrency level |
-| `WARMUP_REQUESTS` | `2` | Discarded warm-up requests per (model, level); only with `CACHE_BUST=1` |
+| `WARMUP_REQUESTS` | `2` | One-off warm-up per **model** (concurrency 1), before any level runs; excluded from timing and statistics |
+| `MIN_WAVES` | `2` | Minimum waves per level (`requests ≥ MIN_WAVES × concurrency`); saturation is `wall ÷ (waves × single-request)`, undefined for a single wave |
 | `INPUT_TOKENS` | `0` | Target input length in tokens (`0` = question bank as-is); sized without a tokenizer (~±15%) |
 | `OUTPUT_TOKENS` | `0` | Output budget, overrides `MAX_TOKENS` when set |
 | `REQUEST_TIMEOUT_SECS` | `1800` | Per-request timeout |
