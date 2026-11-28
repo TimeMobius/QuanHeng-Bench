@@ -8,8 +8,6 @@ import {
   fmtDateLabel, fmtDateTime, fmtDuration, fmtInt, fmtMs, fmtPct, fmtTps,
   msParts, tokenParts, runStatusInfo, fmtConcurrency, fmtFixed,
 } from '../format.js';
-import { mountChart, modelsBarPreset } from '../charts.js';
-import { chartCard } from '../components/chart-card.js';
 import { renderTable, bindTableSort, bindRowLinks, nextSort } from '../components/data-table.js';
 import { emptyState } from '../components/skeleton.js';
 import {
@@ -21,6 +19,7 @@ const TONES = ['', 'is-warn', 'is-bad'];
 
 let sort = { key: 'avg_ttft', dir: 'asc' };
 let latest = { dashboard: null, date: '' };
+let currentLevel = null;
 
 /**
  * Resolve the date this view is showing. Every model link must carry it, or a
@@ -68,121 +67,182 @@ function bestLink(best, key, formatter, date = '') {
   return { model: entry.model, value: formatter(entry.value) };
 }
 
+/**
+ * 并发档位选择。
+ *
+ * 概览页此前用「全档位按请求数加权」的汇总值，那是**没有物理意义的数字**：
+ * 把 1 并发和 128 并发的延迟平均起来，既不代表轻载也不代表满载。
+ *
+ * 现在由用户明确选一个并发档，页面上所有指标都取该档的真实测量值，
+ * 每个数字都能对应到"在这个并发下测得"这样一个确定的条件。
+ */
+function levelOf(ctx) {
+  const params = (ctx.route && ctx.route.params) || null;
+  const raw = params ? Number(params.get('c')) : NaN;
+  return Number.isFinite(raw) && raw > 0 ? raw : null;
+}
+
+/** 当天数据里出现过的并发档位（升序）。 */
+function availableLevels(models) {
+  const set = new Set();
+  models.forEach((model) => (model.records || []).forEach((r) => {
+    if (Number(r.concurrency) > 0 && Number(r.request_count) > 0) set.add(Number(r.concurrency));
+  }));
+  return [...set].sort((a, b) => a - b);
+}
+
+/** 未指定档位时的默认值：取中位数档，尽量避开极端（1 并发与最大并发都不具代表性）。 */
+function defaultLevel(levels) {
+  if (!levels.length) return null;
+  return levels[Math.floor((levels.length - 1) / 2)];
+}
+
+/** 取某模型在指定档位的记录。 */
+function recordAt(model, level) {
+  return (model.records || []).find((r) => Number(r.concurrency) === level) || null;
+}
+
+/**
+ * 按所选档位对一组模型的记录做聚合。
+ *
+ * 同一档位下加权是按请求数（各模型同一档的请求数可能不同），
+ * 但此时所有样本都来自同一并发——这是有意义的加权。
+ */
+function summarizeAtLevel(models, level) {
+  const rows = models
+    .map((model) => ({ model, record: recordAt(model, level) }))
+    .filter((x) => x.record && Number(x.record.request_count) > 0);
+  if (!rows.length) return null;
+
+  const reqs = rows.reduce((a, x) => a + Number(x.record.request_count), 0);
+  const errs = rows.reduce((a, x) => a + Number(x.record.error_count || 0), 0);
+  const w = (pick) => {
+    if (!reqs) return null;
+    return rows.reduce((a, x) => a + pick(x.record) * Number(x.record.request_count), 0) / reqs;
+  };
+  const inputTok = w((r) => Number(r.input_tokens) || 0);
+  const ttftSecs = w((r) => Number(r.avg_ttft_ms) / 1000);
+  const prefill = (inputTok && ttftSecs) ? inputTok / ttftSecs : null;
+
+  return {
+    level,
+    models: rows.length,
+    requests: reqs,
+    errorCount: errs,
+    avgTtft: w((r) => Number(r.avg_ttft_ms)),
+    p95Ttft: w((r) => Number(r.p95_ttft_ms)),
+    prefillTps: prefill,
+    decodeTps: w((r) => Number(r.avg_output_speed_tps)),
+    overallTps: w((r) => Number(r.avg_tps)),
+    successRate: reqs ? ((reqs / (reqs + errs)) * 100) : null,
+    tokens: rows.reduce((a, x) => a + Number(x.record.total_tokens || 0), 0),
+    duration: rows.reduce((a, x) => a + Number(x.record.total_duration_secs || 0), 0),
+  };
+}
+
+/** 某一档下每项指标的最优模型。 */
+function bestAtLevel(models, level) {
+  const entries = models
+    .map((model) => ({ model: model.id, record: recordAt(model, level) }))
+    .filter((x) => x.record && Number(x.record.request_count) > 0);
+  const min = (pick) => {
+    let best = null;
+    entries.forEach((x) => {
+      const v = pick(x.record);
+      if (Number.isFinite(v) && v > 0 && (!best || v < best.value)) best = { model: x.model, value: v };
+    });
+    return best;
+  };
+  const max = (pick) => {
+    let best = null;
+    entries.forEach((x) => {
+      const v = pick(x.record);
+      if (Number.isFinite(v) && v > 0 && (!best || v > best.value)) best = { model: x.model, value: v };
+    });
+    return best;
+  };
+  return {
+    ttft: min((r) => Number(r.avg_ttft_ms)),
+    decode: max((r) => Number(r.avg_output_speed_tps)),
+    success: max((r) => Number(r.success_rate)),
+  };
+}
+
+/** 并发档位选择器（写入 hash 的 c 参数，可分享/刷新保持）。 */
+function levelPicker(ctx, levels, active) {
+  if (levels.length < 2) return raw('');
+  return html`
+    <div class="level-picker" role="group" aria-label="选择并发档位">
+      <span class="level-picker__label">并发</span>
+      ${levels.map((level) => html`
+        <a class="level-chip${level === active ? ' is-active' : ''}"
+           href="#/overview?date=${encodeURIComponent(viewDate(ctx))}&c=${level}"
+           aria-current="${level === active ? 'true' : 'false'}">${fmtConcurrency(level)}</a>
+      `)}
+    </div>
+  `;
+}
+
 function kpiRow(ctx) {
   const dashboard = ctx.state.dashboard;
-  const summary = dashboard.summary || {};
   const models = dashboard.models || [];
+  const level = currentLevel;
+  const agg = level === null ? null : summarizeAtLevel(models, level);
+  const best = level === null ? { ttft: null, decode: null, success: null } : bestAtLevel(models, level);
+  const date = viewDate(ctx);
   const tested = models.filter((model) => model.has_data);
-  const best = dashboard.best || {};
-  const hasData = summaryHasData(summary);
-  const pick = (key) => (hasData ? metricOf(summary, key) : null);
 
-  const ttft = msParts(pick('avg_ttft_ms'));
-  const p95 = msParts(pick('p95_ttft_ms'));
-  const outputSpeed = pick('avg_output_speed_tps');
-  const prefillTps = pick('prefill_tps');
-  const overallTps = pick('avg_tps');
-  const successRate = pick('success_rate');
-  const tokens = tokenParts(hasData ? summary.tokens : null);
-  const bestTtft = bestLink(best, 'ttft', (value) => fmtMs(value));
-  const bestOutput = bestLink(best, 'output_speed', (value) => fmtTps(value));
-  const bestSuccess = bestLink(best, 'success_rate', (value) => fmtPct(value));
+  const ttft = msParts(agg ? agg.avgTtft : null);
+  const prefill = agg ? agg.prefillTps : null;
+  const decode = agg ? agg.decodeTps : null;
+  const success = agg ? agg.successRate : null;
+  const tokens = tokenParts(agg ? agg.tokens : null);
+
+  const bestLink = (entry, fmt) => (entry
+    ? html`最佳 <a href="#/model/${encodeURIComponent(entry.model)}?date=${encodeURIComponent(date)}">${entry.model}</a> ${fmt(entry.value)}`
+    : '该档暂无数据');
 
   return html`
     <div class="kpi-grid">
       ${kpiCard({
-        label: '模型数',
-        value: fmtInt(models.length),
-        hint: html`${fmtInt(tested.length)} 个今日有数据`,
+        label: '有数据模型',
+        value: fmtInt(agg ? agg.models : 0),
+        hint: html`共 ${fmtInt(models.length)} 个 · 本档 ${fmtInt(tested.length)} 个可测`,
       })}
       ${kpiCard({
         label: '请求数',
-        value: fmtInt(summary.requests),
-        hint: hasData
-          ? (summary.error_count
-            ? html`<span class="is-bad">${fmtInt(summary.error_count)} 个失败</span>`
+        value: agg ? fmtInt(agg.requests) : '—',
+        hint: agg
+          ? (agg.errorCount
+            ? html`<span class="is-bad">${fmtInt(agg.errorCount)} 个失败</span>`
             : '全部成功')
-          : '该日期暂无请求',
+          : '该档暂无请求',
       })}
       ${kpiCard({
         label: '平均 TTFT',
         value: ttft.value,
         unit: ttft.unit,
-        accent: hasData,
-        hint: bestTtft
-          ? html`最佳 <a href="#/model/${encodeURIComponent(bestTtft.model)}?date=${encodeURIComponent(viewDate(ctx))}">${bestTtft.model}</a>`
-          : '暂无数据',
-      })}
-      ${kpiCard({
-        label: 'P95 延迟',
-        value: p95.value,
-        unit: p95.unit,
-        hint: hasData ? '按请求数加权' : '暂无数据',
+        accent: Boolean(agg),
+        hint: bestLink(best.ttft, (v) => fmtMs(v)),
       })}
       ${kpiCard({
         label: 'Prefill 吞吐',
-        value: prefillTps === null ? '—' : fmtFixed(prefillTps, 1),
-        unit: prefillTps === null ? '' : 't/s',
-        hint: prefillTps === null
-          ? '该日期为 protocol v1 记录，无输入 token 数'
-          : '输入 token ÷ TTFT · 含排队与网络',
+        value: prefill === null ? '—' : fmtFixed(prefill, 1),
+        unit: prefill === null ? '' : 't/s',
+        hint: prefill === null ? '本档无输入 token 数（protocol v1）' : '输入 token ÷ TTFT · 含排队与网络',
       })}
       ${kpiCard({
         label: 'Decode 吞吐',
-        value: outputSpeed === null ? '—' : fmtFixed(outputSpeed, 1),
-        unit: outputSpeed === null ? '' : 't/s',
-        hint: bestOutput
-          ? html`最佳 <a href="#/model/${encodeURIComponent(bestOutput.model)}?date=${encodeURIComponent(viewDate(ctx))}">${bestOutput.model}</a>`
-          : '暂无数据',
+        value: decode === null ? '—' : fmtFixed(decode, 1),
+        unit: decode === null ? '' : 't/s',
+        hint: bestLink(best.decode, (v) => fmtTps(v)),
       })}
       ${kpiCard({
         label: '成功率',
-        value: successRate === null ? '—' : fmtFixed(successRate, 1),
-        unit: successRate === null ? '' : '%',
-        hint: bestSuccess
-          ? html`最高 <a href="#/model/${encodeURIComponent(bestSuccess.model)}?date=${encodeURIComponent(viewDate(ctx))}">${bestSuccess.model}</a>`
-          : '暂无数据',
+        value: success === null ? '—' : fmtFixed(success, 1),
+        unit: success === null ? '' : '%',
+        hint: bestLink(best.success, (v) => fmtPct(v)),
       })}
-      ${kpiCard({
-        label: '总 Token',
-        value: tokens.value,
-        unit: tokens.unit,
-        hint: hasData ? `总耗时 ${fmtDuration(summary.duration_secs)}` : '暂无数据',
-      })}
-    </div>
-  `;
-}
-
-function bestCard(label, iconName, entry, formatter, unit = '', date = '') {
-  if (!entry || !entry.model) {
-    return html`
-      <div class="best-card best-card--empty">
-        <span class="best-card__label">${icon(iconName, { size: 13, className: 'ico ico--sm' })}${label}</span>
-        <span class="best-card__value">暂无数据</span>
-        <span class="best-card__model">该日期没有成功记录</span>
-      </div>
-    `;
-  }
-  return html`
-    <div class="best-card">
-      <span class="best-card__label">${icon(iconName, { size: 13, className: 'ico ico--sm' })}${label}</span>
-      <span class="best-card__value">${formatter(entry.value)}<span class="unit">${unit}</span></span>
-      <span class="best-card__model">
-        <a href="#/model/${encodeURIComponent(entry.model)}?date=${encodeURIComponent(date)}">${entry.model}</a>
-      </span>
-    </div>
-  `;
-}
-
-function bestRow(ctx) {
-  const best = (ctx.state.dashboard && ctx.state.dashboard.best) || {};
-  const date = viewDate(ctx);
-  return html`
-    <div class="best-grid">
-      ${bestCard('最低平均 TTFT', 'zap', best.ttft, (value) => fmtMs(value), '', date)}
-      ${bestCard('最高整体吞吐', 'gauge', best.tps, (value) => fmtTps(value), '', date)}
-      ${bestCard('最快输出速度', 'activity', best.output_speed, (value) => fmtTps(value), '', date)}
-      ${bestCard('最高成功率', 'trophy', best.success_rate, (value) => fmtPct(value), '', date)}
     </div>
   `;
 }
@@ -238,70 +298,73 @@ function runBanner(ctx) {
 }
 
 function columns() {
+  // 取当前档位的记录；所有数值都来自同一并发，可直接横向比较
+  const rec = (model) => (currentLevel === null ? null : recordAt(model, currentLevel));
+  const val = (pick) => (model) => {
+    const r = rec(model);
+    return r ? pick(r) : null;
+  };
+
   return [
     {
       key: 'id',
       label: '模型',
       align: 'left',
-      sortable: true,
-      sortDefault: 'asc',
       sortValue: (model) => model.id,
       render: (model) => html`<span class="cell-model">${modelAvatar(model)}<span class="cell-model__name">${model.id}</span></span>`,
     },
     {
       key: 'status',
       label: '状态',
-      align: 'left',
-      sortable: true,
-      sortDefault: 'asc',
       sortValue: (model) => ({ good: 0, warn: 1, bad: 2, none: 3 }[model.status] ?? 4),
       render: (model) => html`<span class="cell-model" style="gap:6px">${statusDot(model.status)}${statusBadge(model.status)}</span>`,
     },
     {
       key: 'avg_ttft',
-      label: '平均 TTFT',
+      label: 'TTFT',
       sortable: true,
       sortDefault: 'asc',
-      sortValue: (model) => (model.has_data ? metricOf(model.summary, 'avg_ttft_ms') : null),
-      render: (model) => (model.has_data ? msValue(metricOf(model.summary, 'avg_ttft_ms')) : html`<span class="text-faint">—</span>`),
-      cellTitle: (model) => (model.has_data && Number.isFinite(metricOf(model.summary, 'avg_ttft_ms'))
-        ? `TTFT ${fmtMs(metricOf(model.summary, 'avg_ttft_ms'))}`
-        : '暂无数据'),
+      sortValue: val((r) => Number(r.avg_ttft_ms)),
+      render: (model) => { const r = rec(model); return r ? msValue(r.avg_ttft_ms) : html`<span class="text-faint">—</span>`; },
     },
     {
       key: 'prefill',
       label: 'Prefill',
-      sortValue: (model) => (model.has_data ? metricOf(model.summary, 'prefill_tps') : null),
+      sortable: true,
+      sortDefault: 'desc',
+      sortValue: val((r) => (Number(r.input_tokens) > 0 && Number(r.avg_ttft_ms) > 0
+        ? Number(r.input_tokens) / (Number(r.avg_ttft_ms) / 1000) : null)),
       render: (model) => {
-        const value = model.has_data ? metricOf(model.summary, 'prefill_tps') : null;
-        return value === null ? html`<span class="text-faint">—</span>` : tpsValue(value);
+        const r = rec(model);
+        if (!r || !(Number(r.input_tokens) > 0) || !(Number(r.avg_ttft_ms) > 0)) {
+          return html`<span class="text-faint">—</span>`;
+        }
+        return tpsValue(Number(r.input_tokens) / (Number(r.avg_ttft_ms) / 1000));
       },
     },
     {
-      key: 'output',
+      key: 'decode',
       label: 'Decode',
       sortable: true,
       sortDefault: 'desc',
-      sortValue: (model) => (model.has_data ? metricOf(model.summary, 'avg_output_speed_tps') : null),
-      render: (model) => (model.has_data
-        ? tpsValue(metricOf(model.summary, 'avg_output_speed_tps'), 'is-good')
-        : html`<span class="text-faint">—</span>`),
+      sortValue: val((r) => Number(r.avg_output_speed_tps)),
+      render: (model) => { const r = rec(model); return r ? tpsValue(r.avg_output_speed_tps) : html`<span class="text-faint">—</span>`; },
     },
     {
       key: 'success_rate',
       label: '成功率',
       sortable: true,
       sortDefault: 'desc',
-      sortValue: (model) => (model.has_data ? metricOf(model.summary, 'success_rate') : null),
-      render: (model) => (model.has_data ? rateBar(metricOf(model.summary, 'success_rate')) : html`<span class="text-faint">—</span>`),
+      sortValue: val((r) => Number(r.success_rate)),
+      render: (model) => { const r = rec(model); return r ? rateBar(r.success_rate) : html`<span class="text-faint">—</span>`; },
     },
     {
       key: 'requests',
       label: '请求数',
       sortable: true,
       sortDefault: 'desc',
-      sortValue: (model) => (model.has_data ? metricOf(model.summary, 'requests') : null),
-      render: (model) => (model.has_data ? fmtInt(metricOf(model.summary, 'requests')) : html`<span class="text-faint">—</span>`),
+      sortValue: val((r) => Number(r.request_count)),
+      render: (model) => { const r = rec(model); return r ? fmtInt(r.request_count) : html`<span class="text-faint">—</span>`; },
     },
   ];
 }
@@ -340,11 +403,17 @@ export function render(ctx) {
     `;
   }
 
-  const summary = dashboard.summary || {};
   const config = dashboard.config || {};
   const date = ctx.route.date || dashboard.date || ctx.state.date || ctx.state.today;
+
+  // 并发档位：有 c 参数就用它，否则取中位档（避开 1 与最大这两个极端）
+  const levels = availableLevels(models);
+  const requested = levelOf(ctx);
+  const activeLevel = (requested && levels.includes(requested)) ? requested : defaultLevel(levels);
+  currentLevel = activeLevel;
+
   const tested = models.filter((model) => model.has_data);
-  const levels = (config.concurrency_levels || []).join(' / ');
+  const levelsText = levels.map((l) => fmtConcurrency(l)).join(' / ');
   const upstream = config.base_url || ctx.state.upstreamBase || '';
   const scheduled = config.scheduled || {};
   const scheduleText = Number.isFinite(scheduled.hour)
@@ -360,7 +429,7 @@ export function render(ctx) {
         badge: html`<span class="badge badge--outline">${fmtDateLabel(date)}</span>`,
         sub: [
           html`${fmtInt(tested.length)} / ${fmtInt(models.length)} 个模型有数据`,
-          levels ? html`并发 ${levels}` : '',
+          levelsText ? html`共 ${levels.length} 档：${levelsText}` : '',
           upstream ? html`接口 ${upstream}` : '',
           scheduleText ? html`${scheduleText}` : '',
           protocolBadge(config),
@@ -373,56 +442,26 @@ export function render(ctx) {
 
       ${runBanner(ctx)}
 
+      ${levelPicker(ctx, levels, activeLevel)}
+
       ${kpiRow(ctx)}
 
-      ${bestRow(ctx)}
-
-      <div class="overview-grid">
-        <section class="card">
-          <div class="card__head">
-            <div class="card__titles">
-              <h2 class="card__title">模型状态</h2>
-              <p class="card__sub">点击表头排序 · 点击行进入模型详情</p>
-            </div>
-            <div class="card__actions">
-              <a class="btn btn-ghost btn-sm" href="#/compare?date=${encodeURIComponent(date)}">多模型对比</a>
-            </div>
+      <section class="card">
+        <div class="card__head">
+          <div class="card__titles">
+            <h2 class="card__title">模型状态 · 并发 ${activeLevel === null ? '—' : fmtConcurrency(activeLevel)}</h2>
+            <p class="card__sub">
+              所有指标均为该并发档的实测值 · 点击表头排序 · 点击行进入模型详情
+            </p>
           </div>
-          <div class="card__body card__body--flush" data-model-table>
-            ${modelTable(ctx, date)}
+          <div class="card__actions">
+            <a class="btn btn-ghost btn-sm" href="#/compare?date=${encodeURIComponent(date)}">多模型对比</a>
           </div>
-        </section>
-
-        <div data-overview-chart>
-          ${chartCard({
-            id: 'overview-ttft',
-            title: '各模型平均 TTFT',
-            subtitle: '首 token 延迟 · 横条越短越好 · 按状态着色',
-            ariaLabel: '各模型平均 TTFT 横向柱状图',
-            filename: `models-ttft-${date}.png`,
-            empty: !tested.length,
-            emptyText: '暂无模型数据',
-          })}
-          ${chartCard({
-            id: 'overview-prefill',
-            title: '各模型 Prefill 吞吐',
-            subtitle: '输入 token ÷ TTFT（t/s）· 横条越长越好 · protocol v1 记录无此数据',
-            ariaLabel: '各模型 Prefill 吞吐横向柱状图',
-            filename: `models-prefill-${date}.png`,
-            empty: !tested.length,
-            emptyText: '暂无模型数据',
-          })}
-          ${chartCard({
-            id: 'overview-decode',
-            title: '各模型 Decode 输出速度',
-            subtitle: '首字之后的解码速度（t/s）· 横条越长越好',
-            ariaLabel: '各模型 Decode 输出速度横向柱状图',
-            filename: `models-decode-${date}.png`,
-            empty: !tested.length,
-            emptyText: '暂无模型数据',
-          })}
         </div>
-      </div>
+        <div class="card__body card__body--flush" data-model-table>
+          ${modelTable(ctx, date)}
+        </div>
+      </section>
     </div>
   `;
 }
@@ -445,24 +484,10 @@ export function bind(root, ctx) {
 }
 
 export function mount(root, ctx) {
-  const tested = (ctx.state.dashboard.models || []).filter((model) => model.has_data);
-  if (!tested.length) return;
-  const models = ctx.state.dashboard.models || [];
-  mountChart('overview-ttft', (theme) => modelsBarPreset(models, theme, {
-    pick: (model) => model.summary && model.summary.avg_ttft_ms,
-    label: '平均 TTFT (ms)',
-    unit: 'ms',
-  }));
-  mountChart('overview-prefill', (theme) => modelsBarPreset(models, theme, {
-    pick: (model) => model.summary && model.summary.prefill_tps,
-    label: 'Prefill 吞吐 (t/s)',
-    unit: 'tps',
-  }));
-  mountChart('overview-decode', (theme) => modelsBarPreset(models, theme, {
-    pick: (model) => model.summary && model.summary.avg_output_speed_tps,
-    label: 'Decode 输出速度 (t/s)',
-    unit: 'tps',
-  }));
+  // 概览页不再有图表：柱状图与下方表格表达同样的信息，而表格能精确排序、
+  // 可点击进入详情。图留给模型详情（随并发变化）与对比页（多模型曲线）。
+  void root;
+  void ctx;
 }
 
 export function updateStatus(root, status) {
