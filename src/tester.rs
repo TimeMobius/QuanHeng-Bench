@@ -744,33 +744,64 @@ impl TestRunner {
             0.0
         };
 
-        // Calculate percentiles for TTFT
+        // ---- 聚合口径（按 token 加权，而不是算术平均）----
+        //
+        // 算术平均的问题：一条只输出 10 token 就早停的请求，和一条输出 512 token 的
+        // 请求被同权计入；某条异常慢的样本也会把整档拉低。按 token 加权后，
+        // 「平均值」等价于"这些 token 平均每个花/产出多少"，与总吞吐口径一致：
+        //
+        //   avg_ttft   = Σ(输入token × TTFT) / Σ(输入token)   预填充阶段按输入量摊
+        //   decode tps = Σ(输出token) / Σ(解码窗口)            解码阶段按产出量摊
+        //   avg_tps    = Σ(输出token) / Σ(整请求墙钟)          端到端按产出量摊
+        //
+        // 分位数（p50/p95/p99）仍按每条请求一个样本——分位数问的是"第 N 个请求有多慢"，
+        // 按 token 加权会让长输出请求重复计票，失去分位数的含义。
+
         let mut ttft_values: Vec<f64> = measured_results.iter().map(|r| r.ttft_ms).collect();
         ttft_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        let avg_ttft = if !ttft_values.is_empty() {
-            ttft_values.iter().sum::<f64>() / ttft_values.len() as f64
+        let input_weight: f64 = measured_results
+            .iter()
+            .map(|r| r.prompt_tokens.max(1) as f64)
+            .sum();
+        let avg_ttft = if input_weight > 0.0 {
+            measured_results
+                .iter()
+                .map(|r| r.ttft_ms * r.prompt_tokens.max(1) as f64)
+                .sum::<f64>()
+                / input_weight
         } else {
             0.0
         };
+
         let min_ttft = ttft_values.first().copied().unwrap_or(0.0);
         let max_ttft = ttft_values.last().copied().unwrap_or(0.0);
         let p50_ttft = percentile(&ttft_values, 50.0);
         let p95_ttft = percentile(&ttft_values, 95.0);
         let p99_ttft = percentile(&ttft_values, 99.0);
 
-        let avg_tps = mean(
-            measured_results
-                .iter()
-                .map(|r| r.tokens_per_second)
-                .collect::<Vec<_>>(),
-        );
-        let avg_output_speed = mean(
-            measured_results
-                .iter()
-                .map(|r| r.output_speed_tps)
-                .collect::<Vec<_>>(),
-        );
+        // 解码速度：总输出 token ÷ 总解码窗口（窗口 = 单请求墙钟 − TTFT）
+        let decode_secs: f64 = measured_results
+            .iter()
+            .map(|r| ((r.single_request_ms - r.ttft_ms).max(1.0)) / 1000.0)
+            .sum();
+        let output_tokens_sum: f64 = measured_results.iter().map(|r| r.total_tokens as f64).sum();
+        let avg_output_speed = if decode_secs > 0.0 {
+            output_tokens_sum / decode_secs
+        } else {
+            0.0
+        };
+
+        // 端到端吞吐：总输出 token ÷ 总请求墙钟
+        let wall_secs: f64 = measured_results
+            .iter()
+            .map(|r| r.single_request_ms.max(1.0) / 1000.0)
+            .sum();
+        let avg_tps = if wall_secs > 0.0 {
+            output_tokens_sum / wall_secs
+        } else {
+            0.0
+        };
 
         // Protocol v2 token provenance: a level measured with exact usage
         // frames is "usage", otherwise the numbers are character estimates.
@@ -1134,9 +1165,16 @@ fn merge_runs(
     let failures: usize = runs.iter().map(|run| run.error_count).sum();
     let attempts = successes + failures;
 
-    // Latency/throughput are weighted by successful requests so a run with a
-    // single slow sample cannot dominate the merged record.
-    let weight = |pick: fn(&AggregatedResult) -> f64| -> f64 {
+    // ---- 多轮合并的口径与单轮保持一致：按 token 加权 ----
+    //
+    // 每轮（AggregatedResult）内部已按 token 加权，这里再按"该轮处理的 token 量"
+    // 加权，等价于把各轮的 token 与时间直接相加后相除：
+    //   合并 TTFT   = Σ(该轮输入token × 该轮avg_ttft) / Σ(该轮输入token)
+    //   合并 decode = Σ(该轮输出token) / Σ(该轮解码窗口)
+    //   合并 tps    = Σ(该轮输出token) / Σ(该轮墙钟)
+    //
+    // 只对分位数保留按请求数加权（分位数语义是"第 N 个请求"，不是"第 N 个 token"）。
+    let weight_by_requests = |pick: fn(&AggregatedResult) -> f64| -> f64 {
         if successes == 0 {
             0.0
         } else {
@@ -1145,6 +1183,47 @@ fn merge_runs(
                 .sum::<f64>()
                 / successes as f64
         }
+    };
+
+    // 每轮的输入/输出 token 总量（request_count × 单请求均值）
+    let input_tokens_of = |run: &AggregatedResult| -> f64 {
+        run.input_tokens_avg.max(1.0) * run.request_count as f64
+    };
+    let output_tokens_of = |run: &AggregatedResult| -> f64 { run.total_tokens as f64 };
+
+    let total_input: f64 = runs.iter().map(input_tokens_of).sum();
+    let total_output: f64 = runs.iter().map(output_tokens_of).sum();
+
+    let weight_ttft = if total_input > 0.0 {
+        runs.iter()
+            .map(|run| run.avg_ttft_ms * input_tokens_of(run))
+            .sum::<f64>()
+            / total_input
+    } else {
+        0.0
+    };
+
+    // 每轮的解码窗口 = 该轮 decode 总量 / 该轮 decode 速度
+    let decode_secs_of = |run: &AggregatedResult| -> f64 {
+        let tokens = output_tokens_of(run);
+        if run.avg_output_speed_tps > 0.0 && tokens > 0.0 {
+            tokens / run.avg_output_speed_tps
+        } else {
+            0.0
+        }
+    };
+    let total_decode_secs: f64 = runs.iter().map(decode_secs_of).sum();
+    let weight_decode = if total_decode_secs > 0.0 {
+        total_output / total_decode_secs
+    } else {
+        0.0
+    };
+
+    let total_wall: f64 = runs.iter().map(|run| run.total_duration_secs).sum();
+    let weight_tps = if total_wall > 0.0 {
+        total_output / total_wall
+    } else {
+        0.0
     };
 
     let min_ttft = runs
@@ -1179,20 +1258,20 @@ fn merge_runs(
         request_count: successes,
         error_count: failures,
         error_summary: top_errors(error_summary),
-        avg_ttft_ms: weight(|run| run.avg_ttft_ms),
+        avg_ttft_ms: weight_ttft,
         min_ttft_ms: if min_ttft == f64::MAX { 0.0 } else { min_ttft },
         max_ttft_ms: if max_ttft == f64::MIN { 0.0 } else { max_ttft },
-        p50_ttft_ms: weight(|run| run.p50_ttft_ms),
-        p95_ttft_ms: weight(|run| run.p95_ttft_ms),
-        p99_ttft_ms: weight(|run| run.p99_ttft_ms),
-        avg_output_speed_tps: weight(|run| run.avg_output_speed_tps),
-        avg_tps: weight(|run| run.avg_tps),
+        p50_ttft_ms: weight_by_requests(|run| run.p50_ttft_ms),
+        p95_ttft_ms: weight_by_requests(|run| run.p95_ttft_ms),
+        p99_ttft_ms: weight_by_requests(|run| run.p99_ttft_ms),
+        avg_output_speed_tps: weight_decode,
+        avg_tps: weight_tps,
         total_tokens: runs.iter().map(|run| run.total_tokens).sum(),
-        input_tokens: weight(|run| run.input_tokens_avg),
-        output_tokens: weight(|run| run.output_tokens_avg),
-        single_request_ms: weight(|run| run.single_request_ms),
+        input_tokens: weight_by_requests(|run| run.input_tokens_avg),
+        output_tokens: weight_by_requests(|run| run.output_tokens_avg),
+        single_request_ms: weight_by_requests(|run| run.single_request_ms),
         wave_count: runs.iter().map(|run| run.wave_count).sum(),
-        saturation_ratio: weight(|run| run.saturation_ratio),
+        saturation_ratio: weight_by_requests(|run| run.saturation_ratio),
         token_source: if runs.iter().any(|run| run.token_source == "usage") {
             "usage".to_string()
         } else {
@@ -1754,6 +1833,32 @@ mod tests {
             record.saturation_ratio > 1.0,
             "墙钟 6.8s 超过理想并行 3.0s，饱和比应 > 1，实际 {}",
             record.saturation_ratio
+        );
+    }
+
+    #[test]
+    fn merged_speed_is_weighted_by_token_not_by_request() {
+        // 两轮，刻意让两种口径分歧：
+        //   轮1: 10 请求，输出共 100 token，decode 10 t/s → 解码窗口 10s
+        //   轮2: 10 请求，输出共 900 token，decode 30 t/s → 解码窗口 30s
+        // 按 token 加权: 1000 / 40 = 25 t/s
+        // 按请求加权:   (10 + 30) / 2 = 20 t/s
+        let mut r1 = run_detailed(10, 0, 100.0, 100, 10.0, 1000.0, 1.0);
+        r1.avg_output_speed_tps = 10.0; // 100 token / 10s
+        let mut r2 = run_detailed(10, 0, 100.0, 900, 30.0, 1000.0, 1.0);
+        r2.avg_output_speed_tps = 30.0; // 900 token / 30s
+        let merged = merge_runs("m", 8, "2026-08-27", 8, &[r1, r2], true);
+
+        let expect = 1000.0 / (100.0 / 10.0 + 900.0 / 30.0);
+        assert!(
+            (merged.avg_output_speed_tps - expect).abs() < 1e-6,
+            "多轮合并应按输出 token 加权，期望 {expect:.2} t/s，实际 {}",
+            merged.avg_output_speed_tps
+        );
+        assert!(
+            merged.avg_output_speed_tps > 20.0,
+            "token 加权结果应高于请求加权（20 t/s），实际 {}",
+            merged.avg_output_speed_tps
         );
     }
 

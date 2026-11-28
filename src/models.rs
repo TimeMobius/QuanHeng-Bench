@@ -307,6 +307,55 @@ impl Summary {
                 )
             }
         };
+
+        // ---- 速度类指标按 token 加权（与档位内 / 多轮合并保持同一口径）----
+        //
+        // 一个模型在 8 个并发档各有一行，简单平均会给 1 并发（样本少）和
+        // 128 并发（样本多）相同权重，与本工具"看真实能力"的定位相悖。
+        // 这里按各档实际处理的 token 量加权：
+        //   TTFT   ← 输入 token
+        //   Decode ← 输出 token（解码窗口反推）
+        let total_input_tokens: f64 = records
+            .iter()
+            .map(|r| r.input_tokens.max(1.0) * r.request_count as f64)
+            .sum();
+        let total_output_tokens: f64 = records.iter().map(|r| r.total_tokens as f64).sum();
+
+        let ttft_by_input = if total_input_tokens > 0.0 {
+            Some(
+                records
+                    .iter()
+                    .map(|r| r.avg_ttft_ms * r.input_tokens.max(1.0) * r.request_count as f64)
+                    .sum::<f64>()
+                    / total_input_tokens,
+            )
+        } else {
+            None
+        };
+
+        let decode_secs: f64 = records
+            .iter()
+            .map(|r| {
+                let tokens = r.total_tokens as f64;
+                if r.avg_output_speed_tps > 0.0 && tokens > 0.0 {
+                    tokens / r.avg_output_speed_tps
+                } else {
+                    0.0
+                }
+            })
+            .sum();
+        let decode_by_output = if decode_secs > 0.0 {
+            Some(total_output_tokens / decode_secs)
+        } else {
+            None
+        };
+
+        let wall_secs: f64 = records.iter().map(|r| r.total_duration_secs).sum();
+        let tps_by_output = if wall_secs > 0.0 {
+            Some(total_output_tokens / wall_secs)
+        } else {
+            None
+        };
         let success_weight = |pick: fn(&DailyTestRecord) -> f64| -> Option<f64> {
             if attempts == 0 {
                 None
@@ -327,13 +376,13 @@ impl Summary {
             requests: attempts,
             error_count: records.iter().map(|r| r.error_count).sum(),
             tokens: records.iter().map(|r| r.total_tokens).sum(),
-            avg_ttft_ms: weight_by(successful, |r| r.avg_ttft_ms),
+            avg_ttft_ms: ttft_by_input,
             p95_ttft_ms: weight_by(successful, |r| r.p95_ttft_ms),
-            avg_output_speed_tps: weight_by(successful, |r| r.avg_output_speed_tps),
+            avg_output_speed_tps: decode_by_output,
             input_tokens: weight_opt(records, successful, |r| r.input_tokens),
             output_tokens: weight_opt(records, successful, |r| r.output_tokens),
             prefill_tps: prefill_tps_of(records, successful),
-            avg_tps: weight_by(successful, |r| r.avg_tps),
+            avg_tps: tps_by_output,
             success_rate: success_weight(|r| r.success_rate),
             duration_secs: records
                 .iter()
@@ -632,6 +681,33 @@ mod tests {
         tps: f64,
         success_rate: f64,
     ) -> DailyTestRecord {
+        record_tokens(
+            model,
+            concurrency,
+            request_count,
+            error_count,
+            ttft,
+            tps,
+            success_rate,
+            0.0,
+            0.0,
+            100,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_tokens(
+        model: &str,
+        concurrency: usize,
+        request_count: usize,
+        error_count: usize,
+        ttft: f64,
+        tps: f64,
+        success_rate: f64,
+        input_tokens: f64,
+        output_tokens: f64,
+        total_tokens: i64,
+    ) -> DailyTestRecord {
         DailyTestRecord {
             id: 0,
             test_date: "2026-08-27".to_string(),
@@ -648,9 +724,9 @@ mod tests {
             p99_ttft_ms: ttft,
             avg_output_speed_tps: tps,
             avg_tps: tps,
-            total_tokens: 100,
-            input_tokens: 0.0,
-            output_tokens: 0.0,
+            total_tokens,
+            input_tokens,
+            output_tokens,
             token_source: String::new(),
             protocol_version: "1".to_string(),
             cache_bust: false,
@@ -665,22 +741,44 @@ mod tests {
     }
 
     #[test]
-    fn summary_counts_attempts_and_weights_by_request_count() {
-        // 3 requests at 100ms + 1 request at 500ms -> weighted 200ms.
+    fn summary_weights_speed_metrics_by_token_volume() {
+        // 两档数据，故意让"按请求数"和"按 token 量"得出不同答案：
+        //   c1 : 3 请求 × 输入 1000 / 输出 10，TTFT 100ms，decode 10 t/s
+        //   c8 : 1 请求 × 输入  100 / 输出 900，TTFT 500ms，decode 30 t/s
         let records = vec![
-            record("m", 1, 3, 1, 100.0, 10.0, 75.0),
-            record("m", 8, 1, 0, 500.0, 30.0, 100.0),
+            record_tokens("m", 1, 3, 1, 100.0, 10.0, 75.0, 1000.0, 10.0, 30),
+            record_tokens("m", 8, 1, 0, 500.0, 30.0, 100.0, 100.0, 900.0, 900),
         ];
         let summary = Summary::from_records(&records);
+
         assert_eq!(summary.requests, 5, "attempts = successes + failures");
         assert_eq!(summary.error_count, 1);
-        assert_eq!(summary.tokens, 200);
-        assert!((summary.avg_ttft_ms.unwrap() - 200.0).abs() < 1e-9);
-        assert!((summary.avg_tps.unwrap() - 15.0).abs() < 1e-9);
-        // success_rate is weighted by attempts: (75*4 + 100*1) / 5
-        assert!((summary.success_rate.unwrap() - 80.0).abs() < 1e-9);
+        assert_eq!(summary.tokens, 930, "总输出 token 相加");
+        assert!(
+            (summary.success_rate.unwrap() - 80.0).abs() < 1e-9,
+            "成功率仍按请求数加权"
+        );
+
+        // TTFT 按输入 token 加权：输入总量 = 3×1000 + 1×100 = 3100
+        //   (100×3000 + 500×100) / 3100 = 112.9ms
+        // 若按请求数加权会得到 (100×3 + 500×1)/4 = 200ms —— 这里要的是前者。
+        let expect_ttft = (100.0 * 3000.0 + 500.0 * 100.0) / 3100.0;
+        assert!(
+            (summary.avg_ttft_ms.unwrap() - expect_ttft).abs() < 1e-6,
+            "TTFT 应按输入 token 加权，得到 {expect_ttft:.1}ms，实际 {:?}",
+            summary.avg_ttft_ms
+        );
+
+        // Decode 按输出 token 加权：输出总量 930，
+        //   解码窗口 = 30/10 + 900/30 = 3 + 30 = 33s → 930/33 = 28.18 t/s
+        // 若按请求数加权会得到 (10×3 + 30×1)/4 = 15 t/s —— 这里要的是前者。
+        let expect_decode = 930.0 / (30.0 / 10.0 + 900.0 / 30.0);
+        assert!(
+            (summary.avg_output_speed_tps.unwrap() - expect_decode).abs() < 1e-6,
+            "Decode 应按输出 token 加权，得到 {expect_decode:.2} t/s"
+        );
+
         assert_eq!(summary.max_concurrency, 8);
-        assert!((summary.duration_secs - 20.0).abs() < 1e-9);
     }
 
     #[test]

@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "quanheng-bench"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "axum",
  "chrono",
