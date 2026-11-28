@@ -12,7 +12,7 @@ use crate::models::{DailyTestRecord, RunLogEntry, TrendPoint};
 pub type Db = Arc<Mutex<Connection>>;
 
 /// Schema version written to `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Initialize / migrate the database schema.
 pub fn init_db(db_path: &Path, tz_offset_hours: i32) -> SqlResult<Connection> {
@@ -83,6 +83,12 @@ fn migrate(conn: &Connection, tz_offset_hours: i32) -> SqlResult<()> {
     ensure_column(conn, "protocol_version", "TEXT NOT NULL DEFAULT '1'")?;
     ensure_column(conn, "cache_bust", "INTEGER NOT NULL DEFAULT 0")?;
 
+    // 饱和判定（schema v5）：单请求实测墙钟、波数、以及"实际 / 理想并行"之比。
+    // 用途是回答"这一档请求是否真的同时在跑"，与吞吐聚合无关。
+    ensure_column(conn, "single_request_ms", "REAL NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "wave_count", "REAL NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "saturation_ratio", "REAL NOT NULL DEFAULT 0")?;
+
     // Cached capability of the measured endpoint: does it answer
     // `stream_options.include_usage`? Written by the once-per-run probe.
     conn.execute_batch(
@@ -136,6 +142,27 @@ fn migrate(conn: &Connection, tz_offset_hours: i32) -> SqlResult<()> {
         [],
     )?;
 
+    // 不再回填 saturation_ratio。
+    //
+    // 旧记录（schema ≤ v4）的 total_duration_secs 含按档 warmup 的冷启动开销，
+    // 而 single_request_ms 不含——两者口径不同，硬算出的饱和比会系统性偏高
+    // （实测偏差可达 +7s/档），是错误数据而非"估算值"。
+    //
+    // 因此：single_request_ms / wave_count 仍可从已有字段推导（口径一致），
+    // 但 saturation_ratio 只由新测量写入；历史行保持 0，UI 显示"—"。
+    conn.execute(
+        "UPDATE test_records
+         SET single_request_ms = avg_ttft_ms + CASE
+                 WHEN avg_output_speed_tps > 0 AND output_tokens > 0
+                 THEN output_tokens * 1000.0 / avg_output_speed_tps
+                 ELSE 0 END,
+             wave_count = CASE
+                 WHEN concurrency > 0 THEN CAST(request_count AS REAL) / concurrency
+                 ELSE 0 END
+         WHERE single_request_ms = 0 AND request_count > 0 AND avg_ttft_ms > 0",
+        [],
+    )?;
+
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     Ok(())
 }
@@ -182,9 +209,11 @@ pub fn insert_record(conn: &Connection, record: &DailyTestRecord) -> SqlResult<i
          avg_ttft_ms, min_ttft_ms, max_ttft_ms, p50_ttft_ms, p95_ttft_ms, p99_ttft_ms,
          avg_output_speed_tps, avg_tps, total_tokens, success_rate, total_duration_secs,
          created_at, error_count, error_summary, created_at_local,
-         input_tokens, output_tokens, token_source, protocol_version, cache_bust)
+         input_tokens, output_tokens, token_source, protocol_version, cache_bust,
+         single_request_ms, wave_count, saturation_ratio)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                 datetime('now'), ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                 datetime('now'), ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                 ?25, ?26)
          ON CONFLICT(test_date, model, concurrency) DO UPDATE SET
          request_count=excluded.request_count,
          avg_ttft_ms=excluded.avg_ttft_ms,
@@ -206,7 +235,10 @@ pub fn insert_record(conn: &Connection, record: &DailyTestRecord) -> SqlResult<i
          output_tokens=excluded.output_tokens,
          token_source=excluded.token_source,
          protocol_version=excluded.protocol_version,
-         cache_bust=excluded.cache_bust",
+         cache_bust=excluded.cache_bust,
+         single_request_ms=excluded.single_request_ms,
+         wave_count=excluded.wave_count,
+         saturation_ratio=excluded.saturation_ratio",
         params![
             record.test_date,
             record.model,
@@ -231,6 +263,9 @@ pub fn insert_record(conn: &Connection, record: &DailyTestRecord) -> SqlResult<i
             record.token_source,
             record.protocol_version,
             record.cache_bust as i64,
+            record.single_request_ms,
+            record.wave_count,
+            record.saturation_ratio,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -270,6 +305,9 @@ fn row_to_record(row: &Row<'_>) -> SqlResult<DailyTestRecord> {
         token_source: row.get(22)?,
         protocol_version: row.get(23)?,
         cache_bust: row.get::<_, i64>(24)? != 0,
+        single_request_ms: row.get(25)?,
+        wave_count: row.get(26)?,
+        saturation_ratio: row.get(27)?,
     })
 }
 
@@ -277,7 +315,8 @@ const RECORD_COLUMNS: &str = "id, test_date, model, concurrency, request_count,
         avg_ttft_ms, min_ttft_ms, max_ttft_ms, p50_ttft_ms, p95_ttft_ms, p99_ttft_ms,
         avg_output_speed_tps, avg_tps, total_tokens, success_rate, total_duration_secs,
         created_at, created_at_local, error_summary, error_count,
-        input_tokens, output_tokens, token_source, protocol_version, cache_bust";
+        input_tokens, output_tokens, token_source, protocol_version, cache_bust,
+        single_request_ms, wave_count, saturation_ratio";
 
 /// Get all records for a specific date
 pub fn get_records_by_date(conn: &Connection, date: &str) -> SqlResult<Vec<DailyTestRecord>> {
@@ -504,6 +543,9 @@ mod tests {
             token_source: "usage".to_string(),
             protocol_version: "2".to_string(),
             cache_bust: true,
+            single_request_ms: 3200.0,
+            wave_count: 2.0,
+            saturation_ratio: 1.15,
             success_rate: 87.5,
             total_duration_secs: 12.5,
             created_at: "2026-08-27 03:00:00".to_string(),
@@ -592,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_adds_protocol_columns_and_capability_table() {
+    fn schema_v5_adds_protocol_and_saturation_columns() {
         let path = temp_db_path("v4-migrate");
         // Simulate a v3-era database: the old table shape, no protocol columns.
         {
@@ -629,7 +671,7 @@ mod tests {
         let version: i64 = migrated
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         for column in [
             "input_tokens",
@@ -637,6 +679,9 @@ mod tests {
             "token_source",
             "protocol_version",
             "cache_bust",
+            "single_request_ms",
+            "wave_count",
+            "saturation_ratio",
         ] {
             assert!(
                 table_has_column(&migrated, "test_records", column).unwrap(),

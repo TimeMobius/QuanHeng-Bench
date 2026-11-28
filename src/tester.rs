@@ -628,6 +628,7 @@ impl TestRunner {
             total_tokens,
             prompt_tokens,
             used_usage,
+            single_request_ms: total_duration.as_secs_f64() * 1000.0,
             success: true,
             cancelled: false,
             error: None,
@@ -647,12 +648,9 @@ impl TestRunner {
         progress: &Arc<RunProgress>,
         usage: &UsagePlan,
     ) -> AggregatedResult {
-        let measured = self.config.requests_for_level(concurrency);
-        let warmup = self.config.warmup_for_level();
-        // Warm-up requests run through the same worker pool but are discarded
-        // from the statistics: they absorb cold-start noise (CUDA graphs,
-        // engine queues) without skewing the measured batch.
-        let total_requests = measured + warmup;
+        let total_requests = self.config.requests_for_level(concurrency);
+        // 这一档只跑测量请求。冷启动预热已在模型级的独立阶段完成
+        // （见 `warmup_model`），因此墙钟与统计同口径。
         let test_start = Instant::now();
         let next = Arc::new(AtomicUsize::new(0));
         let questions = Arc::new(questions.to_vec());
@@ -725,10 +723,7 @@ impl TestRunner {
         let mut error_count = 0usize;
         let mut cancelled_count = 0usize;
 
-        for (index, result) in all_indexed {
-            if index < warmup {
-                continue; // discarded warm-up sample
-            }
+        for (_index, result) in all_indexed {
             if result.success {
                 total_tokens += result.total_tokens;
                 measured_results.push(result);
@@ -813,6 +808,27 @@ impl TestRunner {
             "Model concurrency test completed"
         );
 
+        // 饱和判定：把"整档墙钟"和"单请求实测墙钟"摆在一起。
+        //
+        // 若 concurrency 个请求真的并行，跑完一波的时间应该 ≈ 单请求时间；
+        // 一旦实际墙钟明显更长，说明请求在排队，这个档位已经超过模型的有效并发。
+        let single_request_ms = mean(
+            measured_results
+                .iter()
+                .map(|r| r.single_request_ms)
+                .collect::<Vec<_>>(),
+        );
+        let wave_count = if concurrency > 0 {
+            total_requests as f64 / concurrency as f64
+        } else {
+            0.0
+        };
+        let saturation_ratio = if wave_count > 0.0 && single_request_ms > 0.0 {
+            (total_duration.as_secs_f64() * 1000.0) / (wave_count * single_request_ms)
+        } else {
+            0.0
+        };
+
         AggregatedResult {
             model: model.to_string(),
             concurrency,
@@ -830,6 +846,9 @@ impl TestRunner {
             input_tokens_avg,
             output_tokens_avg,
             token_source,
+            single_request_ms,
+            wave_count,
+            saturation_ratio,
             success_rate,
             total_duration_secs: total_duration.as_secs_f64(),
             error_summary,
@@ -850,6 +869,62 @@ impl TestRunner {
         }
     }
 
+    /// One-off warm-up for a model, **before** any measured level runs.
+    ///
+    /// 设计要点（与旧的按档预热不同）：
+    ///   - 单并发（concurrency = 1）：预热只负责把模型"跑热"——加载权重、
+    ///     捕获 CUDA graph、编译 kernel。这些是一次性成本，属于部署环境，
+    ///     不该记到任何并发档头上。
+    ///   - 结果完全丢弃：既不计时、也不进统计、也不写库。
+    ///   - 只跑一次：后续各并发档不再预热，因此各档墙钟与统计同口径，
+    ///     饱和判定才有意义（旧实现让 2 个 warmup 混在 32 个测量请求里
+    ///     同时起跑，既没预热成功，又把冷启动开销摊进了墙钟）。
+    async fn warmup_model(&self, model: &str, questions: &[String]) -> Option<f64> {
+        let count = self.config.warmup_count();
+        if count == 0 {
+            return None;
+        }
+
+        info!(
+            model = %model,
+            count = count,
+            "Warming up model (concurrency 1, excluded from all statistics)"
+        );
+        let start = Instant::now();
+        let no_cancel = Arc::new(AtomicBool::new(false));
+
+        for index in 0..count {
+            let raw_question = if questions.is_empty() {
+                String::new()
+            } else {
+                questions[index % questions.len()].clone()
+            };
+            let spec = RequestSpec {
+                url: format!("{}/v1/chat/completions", self.config.base_url),
+                api_key: self.config.api_key.clone(),
+                model: model.to_string(),
+                question: prompt_for_request(&raw_question, &self.config),
+                max_tokens: self.config.effective_output_tokens(),
+                concurrency: 1,
+                include_usage: false,
+            };
+            // 预热失败不致命：模型可能本就不可用，后续档位会如实记错误。
+            let result =
+                Self::run_single_api_request(self.client.clone(), spec, no_cancel.clone()).await;
+            if !result.success {
+                warn!(
+                    model = %model,
+                    error = %result.error.as_deref().unwrap_or("unknown"),
+                    "Warm-up request failed (ignored)"
+                );
+            }
+        }
+
+        let secs = start.elapsed().as_secs_f64();
+        info!(model = %model, warmup_secs = secs, "Model warm-up finished");
+        Some(secs)
+    }
+
     async fn run_single_model(
         &self,
         model: &str,
@@ -859,6 +934,10 @@ impl TestRunner {
         usage: &UsagePlan,
     ) -> Vec<DailyTestRecord> {
         let mut records = Vec::new();
+
+        // 模型级预热：单并发、跑一次、完全不计入统计与墙钟。
+        let warmup_questions = level_questions.first().cloned().unwrap_or_default();
+        self.warmup_model(model, &warmup_questions).await;
 
         for (level_idx, &concurrency) in self.config.concurrency_levels.iter().enumerate() {
             if progress.is_cancelled() {
@@ -1111,6 +1190,9 @@ fn merge_runs(
         total_tokens: runs.iter().map(|run| run.total_tokens).sum(),
         input_tokens: weight(|run| run.input_tokens_avg),
         output_tokens: weight(|run| run.output_tokens_avg),
+        single_request_ms: weight(|run| run.single_request_ms),
+        wave_count: runs.iter().map(|run| run.wave_count).sum(),
+        saturation_ratio: weight(|run| run.saturation_ratio),
         token_source: if runs.iter().any(|run| run.token_source == "usage") {
             "usage".to_string()
         } else {
@@ -1449,6 +1531,18 @@ mod tests {
         tokens: i64,
         duration: f64,
     ) -> AggregatedResult {
+        run_detailed(successes, failures, avg_ttft, tokens, duration, 800.0, 2.0)
+    }
+
+    fn run_detailed(
+        successes: usize,
+        failures: usize,
+        avg_ttft: f64,
+        tokens: i64,
+        duration: f64,
+        single_request_ms: f64,
+        wave_count: f64,
+    ) -> AggregatedResult {
         let mut error_summary = BTreeMap::new();
         if failures > 0 {
             error_summary.insert("HTTP 429: slow down".to_string(), failures);
@@ -1474,6 +1568,13 @@ mod tests {
                 tokens as f64 / (successes + failures) as f64
             },
             token_source: "estimate".to_string(),
+            single_request_ms,
+            wave_count,
+            saturation_ratio: if wave_count > 0.0 && single_request_ms > 0.0 {
+                duration * 1000.0 / (wave_count * single_request_ms)
+            } else {
+                0.0
+            },
             success_rate: if successes + failures == 0 {
                 0.0
             } else {
@@ -1627,6 +1728,49 @@ mod tests {
     }
 
     #[test]
+    fn saturated_record_keeps_wave_and_single_request_basis() {
+        // 每轮 10 个成功请求、单请求实测 1.2s、整档 3.4s。
+        // concurrency=8 时两轮共 20 请求 = 2.5 波，理论并行时长 3.0s，
+        // 实测 6.8s（两轮累加）→ 饱和比约 2.27，说明请求在排队。
+        // 每轮 10 个成功请求、单请求实测 1.2s、每轮墙钟 3.4s。
+        // 两轮合计 20 请求 / 8 并发 = 2.5 波；理想并行 = 2.5 × 1.2 = 3.0s，
+        // 实测两轮累加 6.8s → 饱和比 ≈ 2.27，说明请求在排队。
+        let runs = vec![
+            run_detailed(10, 0, 100.0, 1200, 3.4, 1200.0, 1.25),
+            run_detailed(10, 0, 100.0, 1200, 3.4, 1200.0, 1.25),
+        ];
+        let record = merge_runs("m", 8, "2026-08-27", 8, &runs, true);
+        assert!(
+            (record.single_request_ms - 1200.0).abs() < 1e-6,
+            "单请求时长按成功请求加权，实测值 {}",
+            record.single_request_ms
+        );
+        assert!(
+            (record.wave_count - 2.5).abs() < 1e-6,
+            "两轮各 1.25 波，合计 2.5 波，实际 {}",
+            record.wave_count
+        );
+        assert!(
+            record.saturation_ratio > 1.0,
+            "墙钟 6.8s 超过理想并行 3.0s，饱和比应 > 1，实际 {}",
+            record.saturation_ratio
+        );
+    }
+
+    #[test]
+    fn unsaturated_record_has_ratio_near_one() {
+        // 单请求 1.0s，8 并发 1.25 波 → 理想 1.25s，实测给 1.25s → 比率≈1。
+        // 单请求 1.0s，8 并发 1.25 波 → 理想并行 1.25s，实测 1.25s。
+        let runs = vec![run_detailed(10, 0, 100.0, 1000, 1.25, 1000.0, 1.25)];
+        let record = merge_runs("m", 8, "2026-08-27", 8, &runs, true);
+        assert!(
+            (record.saturation_ratio - 1.0).abs() < 0.05,
+            "理想并行下饱和比应≈1，实际 {}",
+            record.saturation_ratio
+        );
+    }
+
+    #[test]
     fn merged_record_carries_protocol_metadata() {
         let runs = vec![run(10, 0, 100.0, 1000, 10.0)];
         let record = merge_runs("m", 8, "2026-08-27", 8, &runs, true);
@@ -1648,6 +1792,7 @@ mod tests {
             concurrency_levels: vec![1, 2, 4, 8, 16, 32, 64],
             requests_per_level,
             test_runs: 2,
+            min_waves: 0,
             questions_per_run: 1,
             max_tokens: 16,
             stream_include_usage: UsageMode::Off,

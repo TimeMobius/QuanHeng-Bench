@@ -107,6 +107,12 @@ pub struct RequestResult {
     pub prompt_tokens: i64,
     /// True when the server returned a usage frame (exact-token caliber).
     pub used_usage: bool,
+    /// Measured wall-clock of this single request (send → last byte).
+    ///
+    /// Kept separate from TTFT + generation: it is the actual observed
+    /// duration, used to decide whether `concurrency` requests really ran in
+    /// parallel (wave theory vs. real clock).
+    pub single_request_ms: f64,
     pub success: bool,
     pub cancelled: bool,
     pub error: Option<String>,
@@ -128,6 +134,7 @@ impl RequestResult {
             total_tokens: 0,
             prompt_tokens: 0,
             used_usage: false,
+            single_request_ms: 0.0,
             success: false,
             cancelled: false,
             error: Some(error.into()),
@@ -144,6 +151,7 @@ impl RequestResult {
             total_tokens: 0,
             prompt_tokens: 0,
             used_usage: false,
+            single_request_ms: 0.0,
             success: false,
             cancelled: true,
             error: Some("cancelled".to_string()),
@@ -174,6 +182,14 @@ pub struct AggregatedResult {
     /// "usage" when any request in this level received an exact usage frame,
     /// otherwise "estimate" (character-based token heuristic).
     pub token_source: String,
+    /// Measured single-request wall clock (mean over successful requests).
+    pub single_request_ms: f64,
+    /// Requests issued / concurrency: how many sequential waves this level ran.
+    pub wave_count: f64,
+    /// `total_duration_secs / (wave_count × single_request_ms)`.
+    /// ≈1.0 means all `concurrency` requests truly overlapped (the level is not
+    /// saturated yet); >1 means requests queued behind each other.
+    pub saturation_ratio: f64,
     pub success_rate: f64,
     pub total_duration_secs: f64,
     #[serde(skip)]
@@ -216,6 +232,15 @@ pub struct DailyTestRecord {
     /// Whether prefix-cache busting was active for this record.
     #[serde(default)]
     pub cache_bust: bool,
+    /// Measured single-request wall clock (ms). 0 for legacy v1 records.
+    #[serde(default)]
+    pub single_request_ms: f64,
+    /// Sequential waves this level ran (`request_count / concurrency`).
+    #[serde(default)]
+    pub wave_count: f64,
+    /// Real clock vs. ideal parallel clock; ≈1 = not saturated, >1 = queued.
+    #[serde(default)]
+    pub saturation_ratio: f64,
     pub success_rate: f64,
     pub total_duration_secs: f64,
     pub created_at: String,
@@ -571,6 +596,9 @@ mod tests {
             token_source: String::new(),
             protocol_version: "1".to_string(),
             cache_bust: false,
+            single_request_ms: 0.0,
+            wave_count: 0.0,
+            saturation_ratio: 0.0,
             success_rate,
             total_duration_secs: 10.0,
             created_at: "2026-08-27 00:00:00".to_string(),

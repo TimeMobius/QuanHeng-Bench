@@ -67,8 +67,18 @@ pub struct Config {
     pub concurrency_levels: Vec<usize>,
     /// Minimum requests per concurrency level (0 = use the built-in band only)
     pub requests_per_level: usize,
-    /// Number of test runs per concurrency level (for averaging)
+    /// Number of test runs per concurrency level (for averaging).
+    ///
+    /// Default 2: a single round gives one sample per level, which cannot
+    /// distinguish "truly parallel" from "just did not queue yet".
     pub test_runs: usize,
+    /// Minimum sequential waves per level (requests ≥ waves × concurrency).
+    ///
+    /// Saturation is judged by comparing the real wall clock against
+    /// `waves × single_request_time`; with a single wave that comparison is
+    /// degenerate, so this floors the sample count independently of the
+    /// band formula. 0 disables the floor.
+    pub min_waves: usize,
     /// Number of random questions per test run
     pub questions_per_run: usize,
     /// Max tokens for model responses (legacy output budget; `OUTPUT_TOKENS`
@@ -82,8 +92,15 @@ pub struct Config {
     /// head invalidates reuse of the whole prompt) and rotating the question
     /// set per concurrency level. Off = historical v1 caliber.
     pub cache_bust: bool,
-    /// Discarded warm-up requests before each measured batch (cold-start noise:
-    /// CUDA graphs, engine queues). Only applied when `cache_bust` is on.
+    /// Warm-up requests issued once per model, at concurrency 1, *before* any
+    /// measured level runs.
+    ///
+    /// Rationale: a cold model pays one-off costs (CUDA graph capture, kernel
+    /// build, KV-cache allocation). Those costs belong to the deployment, not
+    /// to any particular concurrency level, so they are paid once up front and
+    /// excluded from both timing and statistics. Per-level warm-up is gone:
+    /// warming 2 requests cannot prepare a 128-wide batch anyway, and it only
+    /// inflated the level wall clock.
     pub warmup_requests: usize,
     /// Protocol v2: target input length in tokens (0 = use the question bank
     /// as-is). The prompt is padded/truncated to `input_tokens * 4` chars
@@ -167,7 +184,7 @@ impl Config {
         }
 
         let requests_per_level = env_parse::<usize>("REQUESTS_PER_LEVEL", 10);
-        let test_runs = env_parse::<usize>("TEST_RUNS", 1);
+        let test_runs = env_parse::<usize>("TEST_RUNS", 2);
         if test_runs == 0 {
             panic!("TEST_RUNS must be >= 1");
         }
@@ -184,6 +201,7 @@ impl Config {
         };
         let cache_bust = env_bool("CACHE_BUST", true);
         let warmup_requests = env_parse::<usize>("WARMUP_REQUESTS", 2);
+        let min_waves = env_parse::<usize>("MIN_WAVES", 2);
         let input_tokens = env_parse::<u32>("INPUT_TOKENS", 0);
         let output_tokens = env_parse::<u32>("OUTPUT_TOKENS", 0);
         let request_timeout_secs = env_parse::<u64>("REQUEST_TIMEOUT_SECS", 1800);
@@ -217,6 +235,7 @@ impl Config {
             concurrency_levels,
             requests_per_level,
             test_runs,
+            min_waves,
             questions_per_run,
             max_tokens,
             stream_include_usage,
@@ -267,18 +286,15 @@ impl Config {
     /// 1x for high) is kept, but `REQUESTS_PER_LEVEL` now acts as a real
     /// lower bound so `p99` is not computed from three samples.
     pub fn requests_for_level(&self, concurrency: usize) -> usize {
-        band_requests(concurrency).max(self.requests_per_level.max(1))
+        let banded = band_requests(concurrency).max(self.requests_per_level.max(1));
+        // 饱和判定需要至少 min_waves 波数据：requests ≥ min_waves × concurrency
+        banded.max(concurrency.saturating_mul(self.min_waves))
     }
 
-    /// Warm-up requests issued per level per run (discarded from statistics).
-    /// Only active in cache-bust mode, where the measured batch must not
-    /// absorb cold-start noise.
-    pub fn warmup_for_level(&self) -> usize {
-        if self.cache_bust {
-            self.warmup_requests
-        } else {
-            0
-        }
+    /// Warm-up requests for the one-off model-level stage (concurrency 1).
+    /// Not multiplied by anything: it runs once, outside the measurement.
+    pub fn warmup_count(&self) -> usize {
+        self.warmup_requests
     }
 
     /// Output token budget sent as `max_tokens`.
@@ -293,11 +309,12 @@ impl Config {
     /// Total requests issued for one model across all concurrency levels
     /// (measured batches plus warm-up requests, which count toward progress).
     pub fn requests_per_model(&self) -> usize {
-        let warmup = self.warmup_for_level();
+        // 每模型的请求数 = 各档测量请求 + 一次性的预热请求（单并发）
         self.concurrency_levels
             .iter()
-            .map(|&level| (self.requests_for_level(level) + warmup) * self.test_runs)
-            .sum()
+            .map(|&level| self.requests_for_level(level) * self.test_runs)
+            .sum::<usize>()
+            + self.warmup_count()
     }
 }
 
@@ -327,6 +344,7 @@ mod tests {
             concurrency_levels: vec![1, 2],
             requests_per_level: 4,
             test_runs: 1,
+            min_waves: 0,
             questions_per_run: 2,
             max_tokens: 512,
             stream_include_usage: UsageMode::Auto,
@@ -364,13 +382,12 @@ mod tests {
     }
 
     #[test]
-    fn warmup_counts_only_in_bust_mode() {
-        assert_eq!(sample_config(true, 3, 0).warmup_for_level(), 3);
-        assert_eq!(
-            sample_config(false, 3, 0).warmup_for_level(),
-            0,
-            "warm-up is a cache-bust concept; off means v1 caliber"
-        );
+    fn warmup_is_one_off_and_cache_bust_independent() {
+        // 预热是模型级的一次性阶段（单并发），与 cache_bust 无关：
+        // 它负责把模型跑热，而不是改善某一档的缓存状态。
+        assert_eq!(sample_config(true, 3, 0).warmup_count(), 3);
+        assert_eq!(sample_config(false, 3, 0).warmup_count(), 3);
+        assert_eq!(sample_config(true, 0, 0).warmup_count(), 0, "0 = 关闭预热");
     }
 
     #[test]
@@ -384,13 +401,34 @@ mod tests {
     }
 
     #[test]
-    fn requests_per_model_includes_warmup() {
-        // levels [1,2], requests_per_level=4 -> band(1)=3 floored to 4,
-        // band(2)=6; warm-up adds 2 per level when busting is on.
+    fn min_waves_floors_requests_per_level() {
+        // min_waves=0 时保持原有 band/floor 行为
+        let mut cfg = sample_config(false, 0, 0);
+        cfg.min_waves = 0;
         assert_eq!(
-            sample_config(true, 2, 0).requests_per_model(),
-            (4 + 2) + (6 + 2)
+            cfg.requests_for_level(1),
+            4,
+            "band(1)=3 被 REQUESTS_PER_LEVEL=4 抬起"
         );
-        assert_eq!(sample_config(false, 2, 0).requests_per_model(), 4 + 6);
+        assert_eq!(cfg.requests_for_level(2), 6, "band(2)=6");
+
+        // min_waves=2 时，高并发档被抬到 2 波样本，才能判定是否排队
+        cfg.min_waves = 2;
+        assert_eq!(cfg.requests_for_level(1), 4, "低并发本来就是多波");
+        assert_eq!(cfg.requests_for_level(2), 6);
+        cfg.concurrency_levels = vec![64];
+        assert_eq!(
+            cfg.requests_for_level(64),
+            128,
+            "64 并发至少要 128 个请求才有 2 波，否则单波无法判定饱和"
+        );
+    }
+
+    #[test]
+    fn requests_per_model_adds_warmup_once_not_per_level() {
+        // levels [1,2]，requests_per_level=4 → band(1)=3 被抬到 4，band(2)=6。
+        // 预热只在模型级跑一次（2 个请求），不再按档累加。
+        assert_eq!(sample_config(true, 2, 0).requests_per_model(), 4 + 6 + 2);
+        assert_eq!(sample_config(false, 2, 0).requests_per_model(), 4 + 6 + 2);
     }
 }

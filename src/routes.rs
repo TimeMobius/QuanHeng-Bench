@@ -263,7 +263,7 @@ fn config_view(config: &Config) -> ConfigView {
         input_tokens: config.input_tokens,
         stream_include_usage: config.stream_include_usage.to_string(),
         cache_bust: config.cache_bust,
-        warmup_requests: config.warmup_for_level(),
+        warmup_requests: config.warmup_count(),
         protocol_version: crate::config::PROTOCOL_VERSION.to_string(),
         request_timeout_secs: config.request_timeout_secs,
         timezone_offset_hours: config.timezone_offset_hours,

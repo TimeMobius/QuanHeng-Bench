@@ -125,6 +125,105 @@ function table(ctx) {
   });
 }
 
+/**
+ * 并发承载判定。
+ *
+ * 饱和比 = 整档实测墙钟 ÷ (波数 × 单请求实测墙钟)。
+ *   ≈1.0 表示 concurrency 个请求确实同时在跑；
+ *   >1.2 表示请求在排队，该档位已经超过模型的真实并发能力。
+ *
+ * 取饱和比 ≤ 1.15 的最高并发作为「实测可用并发」——这是"能不能同时处理
+ * 这么多请求"的直接答案，与吞吐聚合无关（聚合会被调度效率污染）。
+ */
+const SATURATION_LIMIT = 1.15;
+
+function capacityVerdict(records) {
+  const usable = (records || [])
+    .filter((r) => Number(r.concurrency) > 0 && Number(r.saturation_ratio) > 0)
+    .slice()
+    .sort((a, b) => a.concurrency - b.concurrency);
+  if (!usable.length) return null;
+
+  const stable = usable.filter((r) => r.saturation_ratio <= SATURATION_LIMIT);
+  const best = stable.length ? stable[stable.length - 1] : null;
+  const peak = usable.reduce((a, b) => (b.concurrency > a.concurrency ? b : a));
+  const saturatedFrom = usable.find((r) => r.saturation_ratio > SATURATION_LIMIT) || null;
+
+  return {
+    usable: best ? best.concurrency : 0,
+    peak,
+    saturatedFrom,
+    maxConfigured: peak.concurrency,
+    allStable: !saturatedFrom,
+  };
+}
+
+function capacityCard(records) {
+  const verdict = capacityVerdict(records);
+  if (!verdict) {
+    return html`
+      <section class="card">
+        <div class="card__head">
+          <div class="card__titles">
+            <h2 class="card__title">并发承载</h2>
+            <p class="card__sub">该日期没有可用的饱和判定数据（protocol v1 记录无单请求实测时间）</p>
+          </div>
+        </div>
+      </section>
+    `;
+  }
+  const rows = (records || [])
+    .filter((r) => Number(r.concurrency) > 0)
+    .slice()
+    .sort((a, b) => a.concurrency - b.concurrency)
+    .map((r) => ({
+      level: r.concurrency,
+      waves: r.wave_count,
+      singleMs: r.single_request_ms,
+      ratio: r.saturation_ratio,
+    }));
+
+  return html`
+    <section class="card">
+      <div class="card__head">
+        <div class="card__titles">
+          <h2 class="card__title">并发承载</h2>
+          <p class="card__sub">
+            饱和比 = 实测墙钟 ÷ (波数 × 单请求实测墙钟)；≤${SATURATION_LIMIT} 视为该档请求真正并行
+          </p>
+        </div>
+        <div class="card__actions">
+          ${verdict.allStable
+            ? html`<span class="badge badge--good">配置内未饱和 · 实测可用 ≥ ${fmtConcurrency(verdict.maxConfigured)}</span>`
+            : html`<span class="badge badge--warn">实测可用并发 ≈ ${fmtConcurrency(verdict.usable || 1)}</span>`}
+        </div>
+      </div>
+      <div class="card__body card__body--flush">
+        ${renderTable({
+          columns: [
+            { key: 'level', label: '并发', align: 'left', render: (row) => html`<strong>${fmtConcurrency(row.level)}</strong>` },
+            { key: 'waves', label: '波数', render: (row) => (Number.isFinite(row.waves) ? fmtFixed(row.waves, 2) : '—') },
+            { key: 'singleMs', label: '单请求实测', render: (row) => (Number(row.singleMs) > 0 ? msValue(row.singleMs) : '—') },
+            {
+              key: 'ratio',
+              label: '饱和比',
+              render: (row) => {
+                const value = Number(row.ratio);
+                if (!(value > 0)) return html`<span class="text-faint">—</span>`;
+                const tone = value <= 1.05 ? 'badge--good' : value <= SATURATION_LIMIT ? 'badge--info' : 'badge--warn';
+                return html`<span class="badge ${tone}">${fmtFixed(value, 2)}</span>`;
+              },
+            },
+          ],
+          rows,
+          ariaLabel: '各并发档位的饱和判定',
+          emptyText: '暂无数据',
+        })}
+      </div>
+    </section>
+  `;
+}
+
 function summaryChips(model) {
   const summary = model.summary || {};
   const hasData = Boolean(model.has_data);
@@ -252,6 +351,7 @@ export function render(ctx) {
 
       ${hasData
         ? html`
+            ${capacityCard(records)}
             <section class="card">
               <div class="card__head">
                 <div class="card__titles">
