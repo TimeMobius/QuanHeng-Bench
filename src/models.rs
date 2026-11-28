@@ -379,8 +379,10 @@ pub struct ConfigView {
     pub stream_include_usage: String,
     /// Protocol v2 prefix-cache busting active?
     pub cache_bust: bool,
-    /// Warm-up requests discarded per level (0 when cache_bust is off).
+    /// One-off model-level warm-up request count.
     pub warmup_requests: usize,
+    /// Minimum waves per level (requests ≥ min_waves × concurrency).
+    pub min_waves: usize,
     /// Measurement protocol implemented by this binary ("2").
     pub protocol_version: String,
     pub request_timeout_secs: u64,
