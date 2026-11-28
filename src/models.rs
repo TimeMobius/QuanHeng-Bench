@@ -381,8 +381,6 @@ pub struct ConfigView {
     pub cache_bust: bool,
     /// One-off model-level warm-up request count.
     pub warmup_requests: usize,
-    /// Minimum waves per level (requests ≥ min_waves × concurrency).
-    pub min_waves: usize,
     /// Measurement protocol implemented by this binary ("2").
     pub protocol_version: String,
     pub request_timeout_secs: u64,

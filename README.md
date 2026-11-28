@@ -127,7 +127,6 @@ All settings are environment variables (a YAML file is on the roadmap).
 | `STREAM_INCLUDE_USAGE` | `auto` | `auto` probes the endpoint once per run and asks for exact `usage` if it is accepted (a 4xx rejection falls back to estimation); `true` always sends, `false` never does |
 | `CACHE_BUST` | `true` | Defeat prefix KV caching: unique nonce at the **head** of every prompt + a fresh question set per concurrency level |
 | `WARMUP_REQUESTS` | `2` | One-off warm-up per **model** (concurrency 1), before any level runs; excluded from timing and statistics |
-| `MIN_WAVES` | `2` | Minimum waves per level (`requests ≥ MIN_WAVES × concurrency`); saturation is `wall ÷ (waves × single-request)`, undefined for a single wave |
 | `INPUT_TOKENS` | `0` | Target input length in tokens (`0` = question bank as-is); sized without a tokenizer (~±15%) |
 | `OUTPUT_TOKENS` | `0` | Output budget, overrides `MAX_TOKENS` when set |
 | `REQUEST_TIMEOUT_SECS` | `1800` | Per-request timeout |

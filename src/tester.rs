@@ -1792,7 +1792,6 @@ mod tests {
             concurrency_levels: vec![1, 2, 4, 8, 16, 32, 64],
             requests_per_level,
             test_runs: 2,
-            min_waves: 0,
             questions_per_run: 1,
             max_tokens: 16,
             stream_include_usage: UsageMode::Off,

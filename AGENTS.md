@@ -20,7 +20,7 @@ QuanHeng-Bench 是一个 Rust 编写的 LLM API 性能测试与可视化工具�
 7. 每个并发级别跑 `TEST_RUNS` 轮取平均值
 8. 每轮请求数 = `max(band(并发), REQUESTS_PER_LEVEL)`，
    band = 并发×3（≤4）/ 并发×2（≤16）/ 并发×1（>16），保证低并发也有足够样本算 P99；
-   另保证至少 `MIN_WAVES` 波样本（请求数 ≥ MIN_WAVES × 并发），供饱和判定使用
+   每档至少 2 波（`TEST_RUNS=2` 天然满足），供饱和判定使用
 9. **构造 prompt**：按 `INPUT_TOKENS` 目标长度填充或截断题目；`CACHE_BUST=1` 时在 prompt **头部**
    插入唯一 nonce（`# qh-<epoch>-<seq>`）——前缀 KV 缓存从头匹配，头部不同即全 prompt 不可复用。
    nonce 必须放头部，放尾部无效。
@@ -90,7 +90,6 @@ QuanHeng-Bench 是一个 Rust 编写的 LLM API 性能测试与可视化工具�
 | `STREAM_INCLUDE_USAGE` | `auto` | `auto`（默认）= 每次运行前一次性探测端点是否支持 `stream_options.include_usage`，支持则精确 usage、4xx 拒绝则回落估算，结果持久化到 `endpoint_capabilities`；`true` 强制发送；`false` 从不发送 |
 | `CACHE_BUST` | `true` | 前缀缓存绕过：每个请求在 prompt 头部插入唯一 nonce + 按并发级别轮换抽题。关闭则为 v1 口径（含缓存命中，TTFT 偏低） |
 | `WARMUP_REQUESTS` | `2` | **模型级**一次性预热请求数（单并发），在所有档位测量之前跑完；完全不计时、不计统计、不写库。各并发档不再预热 |
-| `MIN_WAVES` | `2` | 每档最少波数（请求数 ≥ MIN_WAVES × 并发）。饱和判定靠「实测墙钟 ÷ (波数 × 单请求墙钟)」，单波无法判定 |
 | `INPUT_TOKENS` | `0` | 目标输入长度（token）。`0` = 直接用题库题目；>0 时按 `token × 4` 字符填充/截断（无 tokenizer，偏差约 ±15%） |
 | `OUTPUT_TOKENS` | `0` | 输出 token 预算；`0` = 用 `MAX_TOKENS`。同时决定请求体 `max_tokens` |
 | `CORS_ORIGINS` | (空) | 逗号分隔的允许来源；为空 = 仅同源（不再 `allow_origin(Any)`） |

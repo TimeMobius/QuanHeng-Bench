@@ -72,13 +72,6 @@ pub struct Config {
     /// Default 2: a single round gives one sample per level, which cannot
     /// distinguish "truly parallel" from "just did not queue yet".
     pub test_runs: usize,
-    /// Minimum sequential waves per level (requests ≥ waves × concurrency).
-    ///
-    /// Saturation is judged by comparing the real wall clock against
-    /// `waves × single_request_time`; with a single wave that comparison is
-    /// degenerate, so this floors the sample count independently of the
-    /// band formula. 0 disables the floor.
-    pub min_waves: usize,
     /// Number of random questions per test run
     pub questions_per_run: usize,
     /// Max tokens for model responses (legacy output budget; `OUTPUT_TOKENS`
@@ -201,7 +194,6 @@ impl Config {
         };
         let cache_bust = env_bool("CACHE_BUST", true);
         let warmup_requests = env_parse::<usize>("WARMUP_REQUESTS", 2);
-        let min_waves = env_parse::<usize>("MIN_WAVES", 2);
         let input_tokens = env_parse::<u32>("INPUT_TOKENS", 0);
         let output_tokens = env_parse::<u32>("OUTPUT_TOKENS", 0);
         let request_timeout_secs = env_parse::<u64>("REQUEST_TIMEOUT_SECS", 1800);
@@ -235,7 +227,6 @@ impl Config {
             concurrency_levels,
             requests_per_level,
             test_runs,
-            min_waves,
             questions_per_run,
             max_tokens,
             stream_include_usage,
@@ -286,9 +277,7 @@ impl Config {
     /// 1x for high) is kept, but `REQUESTS_PER_LEVEL` now acts as a real
     /// lower bound so `p99` is not computed from three samples.
     pub fn requests_for_level(&self, concurrency: usize) -> usize {
-        let banded = band_requests(concurrency).max(self.requests_per_level.max(1));
-        // 饱和判定需要至少 min_waves 波数据：requests ≥ min_waves × concurrency
-        banded.max(concurrency.saturating_mul(self.min_waves))
+        band_requests(concurrency).max(self.requests_per_level.max(1))
     }
 
     /// Warm-up requests for the one-off model-level stage (concurrency 1).
@@ -344,7 +333,6 @@ mod tests {
             concurrency_levels: vec![1, 2],
             requests_per_level: 4,
             test_runs: 1,
-            min_waves: 0,
             questions_per_run: 2,
             max_tokens: 512,
             stream_include_usage: UsageMode::Auto,
@@ -397,30 +385,6 @@ mod tests {
             sample_config(true, 0, 0).effective_output_tokens(),
             512,
             "falls back to MAX_TOKENS when OUTPUT_TOKENS is unset"
-        );
-    }
-
-    #[test]
-    fn min_waves_floors_requests_per_level() {
-        // min_waves=0 时保持原有 band/floor 行为
-        let mut cfg = sample_config(false, 0, 0);
-        cfg.min_waves = 0;
-        assert_eq!(
-            cfg.requests_for_level(1),
-            4,
-            "band(1)=3 被 REQUESTS_PER_LEVEL=4 抬起"
-        );
-        assert_eq!(cfg.requests_for_level(2), 6, "band(2)=6");
-
-        // min_waves=2 时，高并发档被抬到 2 波样本，才能判定是否排队
-        cfg.min_waves = 2;
-        assert_eq!(cfg.requests_for_level(1), 4, "低并发本来就是多波");
-        assert_eq!(cfg.requests_for_level(2), 6);
-        cfg.concurrency_levels = vec![64];
-        assert_eq!(
-            cfg.requests_for_level(64),
-            128,
-            "64 并发至少要 128 个请求才有 2 波，否则单波无法判定饱和"
         );
     }
 
