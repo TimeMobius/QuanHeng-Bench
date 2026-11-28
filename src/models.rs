@@ -262,6 +262,18 @@ pub struct Summary {
     pub avg_ttft_ms: Option<f64>,
     pub p95_ttft_ms: Option<f64>,
     pub avg_output_speed_tps: Option<f64>,
+    /// Mean input tokens per request (weighted); None for v1-only data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<f64>,
+    /// Mean output tokens per request (weighted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<f64>,
+    /// Prefill effective throughput = input_tokens / (TTFT / 1000), t/s.
+    ///
+    /// 与 Decode 速度同量纲，便于在概览里并排比较"预填充"与"解码"两个阶段。
+    /// v1 记录没有 input_tokens，这里为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_tps: Option<f64>,
     pub avg_tps: Option<f64>,
     pub success_rate: Option<f64>,
     pub duration_secs: f64,
@@ -318,6 +330,9 @@ impl Summary {
             avg_ttft_ms: weight_by(successful, |r| r.avg_ttft_ms),
             p95_ttft_ms: weight_by(successful, |r| r.p95_ttft_ms),
             avg_output_speed_tps: weight_by(successful, |r| r.avg_output_speed_tps),
+            input_tokens: weight_opt(records, successful, |r| r.input_tokens),
+            output_tokens: weight_opt(records, successful, |r| r.output_tokens),
+            prefill_tps: prefill_tps_of(records, successful),
             avg_tps: weight_by(successful, |r| r.avg_tps),
             success_rate: success_weight(|r| r.success_rate),
             duration_secs: records
@@ -328,6 +343,49 @@ impl Summary {
             max_concurrency: records.iter().map(|r| r.concurrency).max().unwrap_or(0),
         }
     }
+}
+
+/// Weighted mean of an optional per-record metric; None when every record is 0
+/// (legacy v1 rows have no token breakdown).
+fn weight_opt(
+    records: &[DailyTestRecord],
+    total: usize,
+    pick: fn(&DailyTestRecord) -> f64,
+) -> Option<f64> {
+    if total == 0 {
+        return None;
+    }
+    let sum: f64 = records
+        .iter()
+        .map(|r| pick(r) * r.request_count as f64)
+        .sum();
+    if sum <= 0.0 {
+        return None;
+    }
+    Some(sum / total as f64)
+}
+
+/// Prefill effective throughput across records: total input tokens over total
+/// time spent waiting for the first token.
+///
+/// 用"总量相除"而不是"逐条速度取平均"：TTFT 相差悬殊时，后者会被慢的那条
+/// 主导，而前者等价于整体预填充带宽。
+fn prefill_tps_of(records: &[DailyTestRecord], total: usize) -> Option<f64> {
+    if total == 0 {
+        return None;
+    }
+    let input_tokens: f64 = records
+        .iter()
+        .map(|r| r.input_tokens * r.request_count as f64)
+        .sum();
+    let ttft_secs: f64 = records
+        .iter()
+        .map(|r| (r.avg_ttft_ms / 1000.0) * r.request_count as f64)
+        .sum();
+    if input_tokens <= 0.0 || ttft_secs <= 0.0 {
+        return None;
+    }
+    Some(input_tokens / ttft_secs)
 }
 
 /// One model as exposed by the dashboard payload.

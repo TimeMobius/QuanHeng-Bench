@@ -394,8 +394,22 @@ export function compositePreset(rows, theme) {
 }
 
 /** 概览：各模型平均 TTFT 横向柱状图。 */
-export function modelsBarPreset(models, theme) {
-  const usable = models.filter((model) => model.summary && Number.isFinite(model.summary.avg_ttft_ms));
+/**
+ * 概览：各模型横向柱状图（通用）。
+ *
+ * spec: { pick, label, unit, tickFormatter, min?, inverse? }
+ *   pick(model, records) → 数值；inverse 用于"越低越好"的指标（配色反序）。
+ */
+export function modelsBarPreset(models, theme, spec = {}) {
+  const {
+    pick = (model) => model.summary && model.summary.avg_ttft_ms,
+    label = '平均 TTFT (ms)',
+    unit = 'ms',
+  } = spec;
+  const usable = models.filter((model) => {
+    const value = pick(model);
+    return Number.isFinite(value);
+  });
   const labels = usable.map((model) => (model.id.length > 22 ? `${model.id.slice(0, 21)}…` : model.id));
   const colors = usable.map((model, index) => (model.status === 'good'
     ? withAlpha(colorFor(theme, 0), 0.9)
@@ -409,12 +423,12 @@ export function modelsBarPreset(models, theme) {
     data: {
       labels,
       datasets: [{
-        label: '平均 TTFT (ms)',
-        data: usable.map((model) => model.summary.avg_ttft_ms),
+        label,
+        data: usable.map((model) => pick(model)),
         backgroundColor: colors,
         borderRadius: 5,
         maxBarThickness: 22,
-        hcUnit: 'ms',
+        hcUnit: unit,
       }],
     },
   };
@@ -423,7 +437,7 @@ export function modelsBarPreset(models, theme) {
   options.plugins.legend.display = false;
   options.plugins.tooltip.callbacks = tooltipCallbacks(theme);
   options.scales = {
-    x: valueScale(theme, { title: '平均 TTFT (ms)', showGrid: true }),
+    x: valueScale(theme, { title: label, showGrid: true }),
     y: {
       type: 'category',
       labels,

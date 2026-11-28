@@ -80,6 +80,7 @@ function kpiRow(ctx) {
   const ttft = msParts(pick('avg_ttft_ms'));
   const p95 = msParts(pick('p95_ttft_ms'));
   const outputSpeed = pick('avg_output_speed_tps');
+  const prefillTps = pick('prefill_tps');
   const overallTps = pick('avg_tps');
   const successRate = pick('success_rate');
   const tokens = tokenParts(hasData ? summary.tokens : null);
@@ -119,7 +120,15 @@ function kpiRow(ctx) {
         hint: hasData ? '按请求数加权' : '暂无数据',
       })}
       ${kpiCard({
-        label: '输出速度',
+        label: 'Prefill 吞吐',
+        value: prefillTps === null ? '—' : fmtFixed(prefillTps, 1),
+        unit: prefillTps === null ? '' : 't/s',
+        hint: prefillTps === null
+          ? '该日期为 protocol v1 记录，无输入 token 数'
+          : '输入 token ÷ TTFT · 含排队与网络',
+      })}
+      ${kpiCard({
+        label: 'Decode 吞吐',
         value: outputSpeed === null ? '—' : fmtFixed(outputSpeed, 1),
         unit: outputSpeed === null ? '' : 't/s',
         hint: bestOutput
@@ -260,8 +269,17 @@ function columns() {
         : '暂无数据'),
     },
     {
+      key: 'prefill',
+      label: 'Prefill',
+      sortValue: (model) => (model.has_data ? metricOf(model.summary, 'prefill_tps') : null),
+      render: (model) => {
+        const value = model.has_data ? metricOf(model.summary, 'prefill_tps') : null;
+        return value === null ? html`<span class="text-faint">—</span>` : tpsValue(value);
+      },
+    },
+    {
       key: 'output',
-      label: '输出速度',
+      label: 'Decode',
       sortable: true,
       sortDefault: 'desc',
       sortValue: (model) => (model.has_data ? metricOf(model.summary, 'avg_output_speed_tps') : null),
@@ -379,9 +397,27 @@ export function render(ctx) {
           ${chartCard({
             id: 'overview-ttft',
             title: '各模型平均 TTFT',
-            subtitle: '横条越短越好 · 按状态着色',
+            subtitle: '首 token 延迟 · 横条越短越好 · 按状态着色',
             ariaLabel: '各模型平均 TTFT 横向柱状图',
             filename: `models-ttft-${date}.png`,
+            empty: !tested.length,
+            emptyText: '暂无模型数据',
+          })}
+          ${chartCard({
+            id: 'overview-prefill',
+            title: '各模型 Prefill 吞吐',
+            subtitle: '输入 token ÷ TTFT（t/s）· 横条越长越好 · protocol v1 记录无此数据',
+            ariaLabel: '各模型 Prefill 吞吐横向柱状图',
+            filename: `models-prefill-${date}.png`,
+            empty: !tested.length,
+            emptyText: '暂无模型数据',
+          })}
+          ${chartCard({
+            id: 'overview-decode',
+            title: '各模型 Decode 输出速度',
+            subtitle: '首字之后的解码速度（t/s）· 横条越长越好',
+            ariaLabel: '各模型 Decode 输出速度横向柱状图',
+            filename: `models-decode-${date}.png`,
             empty: !tested.length,
             emptyText: '暂无模型数据',
           })}
@@ -411,7 +447,22 @@ export function bind(root, ctx) {
 export function mount(root, ctx) {
   const tested = (ctx.state.dashboard.models || []).filter((model) => model.has_data);
   if (!tested.length) return;
-  mountChart('overview-ttft', (theme) => modelsBarPreset(ctx.state.dashboard.models || [], theme));
+  const models = ctx.state.dashboard.models || [];
+  mountChart('overview-ttft', (theme) => modelsBarPreset(models, theme, {
+    pick: (model) => model.summary && model.summary.avg_ttft_ms,
+    label: '平均 TTFT (ms)',
+    unit: 'ms',
+  }));
+  mountChart('overview-prefill', (theme) => modelsBarPreset(models, theme, {
+    pick: (model) => model.summary && model.summary.prefill_tps,
+    label: 'Prefill 吞吐 (t/s)',
+    unit: 'tps',
+  }));
+  mountChart('overview-decode', (theme) => modelsBarPreset(models, theme, {
+    pick: (model) => model.summary && model.summary.avg_output_speed_tps,
+    label: 'Decode 输出速度 (t/s)',
+    unit: 'tps',
+  }));
 }
 
 export function updateStatus(root, status) {
